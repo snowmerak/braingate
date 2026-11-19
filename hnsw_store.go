@@ -30,11 +30,12 @@ type HNSWConfig struct {
 // HNSWStore is a concurrency-safe MemoryStore backed by internal/hnsw with
 // circular affect-space filtering and atomic file persistence.
 type HNSWStore struct {
-	mu       sync.RWMutex
-	cfg      HNSWConfig
-	memories map[string]Memory
-	index    *hnsw.Graph[string]
-	dims     int
+	mu            sync.RWMutex
+	cfg           HNSWConfig
+	memories      map[string]Memory
+	index         *hnsw.Graph[string]
+	dims          int
+	secondaryDims int
 }
 
 // NewHNSWStore creates an empty HNSWStore using cfg (zero fields use defaults).
@@ -75,7 +76,7 @@ func (s *HNSWStore) Upsert(ctx context.Context, memories []Memory) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	batchDim, err := validateMemories(memories)
+	batchDim, batchSecDim, err := validateMemories(memories)
 	if err != nil {
 		return err
 	}
@@ -85,6 +86,9 @@ func (s *HNSWStore) Upsert(ctx context.Context, memories []Memory) error {
 
 	if s.index.Len() > 0 && batchDim > 0 && batchDim != s.dims {
 		return fmt.Errorf("braingate: embedding dimension %d does not match store dimension %d", batchDim, s.dims)
+	}
+	if s.secondaryDims > 0 && batchSecDim > 0 && batchSecDim != s.secondaryDims {
+		return fmt.Errorf("braingate: secondary embedding dimension %d does not match store secondary dimension %d", batchSecDim, s.secondaryDims)
 	}
 
 	for _, m := range memories {
@@ -101,6 +105,12 @@ func (s *HNSWStore) Upsert(ctx context.Context, memories []Memory) error {
 				s.dims = 0
 			}
 		}
+		if len(cloned.SecondaryEmbedding) > 0 && s.secondaryDims == 0 {
+			s.secondaryDims = len(cloned.SecondaryEmbedding)
+		}
+	}
+	if !s.hasSecondaryEmbeddingsLocked() {
+		s.secondaryDims = 0
 	}
 	return nil
 }
@@ -124,7 +134,19 @@ func (s *HNSWStore) Delete(ctx context.Context, ids []string) error {
 	if s.index.Len() == 0 {
 		s.dims = 0
 	}
+	if !s.hasSecondaryEmbeddingsLocked() {
+		s.secondaryDims = 0
+	}
 	return nil
+}
+
+func (s *HNSWStore) hasSecondaryEmbeddingsLocked() bool {
+	for _, m := range s.memories {
+		if len(m.SecondaryEmbedding) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Search queries memories within query.Radius around query.Probe, optionally filtering
@@ -184,6 +206,9 @@ func (s *HNSWStore) Search(ctx context.Context, query SearchQuery) ([]ScoredMemo
 	if len(query.Vector) != s.dims {
 		return nil, fmt.Errorf("braingate: search vector dimension %d does not match store dimension %d", len(query.Vector), s.dims)
 	}
+	if len(query.SecondaryVector) > 0 && s.secondaryDims > 0 && len(query.SecondaryVector) != s.secondaryDims {
+		return nil, fmt.Errorf("braingate: search secondary vector dimension %d does not match store secondary dimension %d", len(query.SecondaryVector), s.secondaryDims)
+	}
 
 	hits := s.index.SearchFiltered(toFloat32(query.Vector), limit, func(id string) bool {
 		if query.ExcludeIDs[id] {
@@ -208,10 +233,19 @@ func (s *HNSWStore) Search(ctx context.Context, query SearchQuery) ([]ScoredMemo
 		}
 		dist := math.Hypot(query.Probe.Valence-m.Position.Valence, query.Probe.Activation-m.Position.Activation)
 		sim := cosineSimilarity(query.Vector, m.Embedding)
+		var secSimPtr *float64
+		if len(query.SecondaryVector) > 0 && len(m.SecondaryEmbedding) > 0 {
+			if len(m.SecondaryEmbedding) != len(query.SecondaryVector) {
+				return nil, fmt.Errorf("braingate: memory %q secondary embedding dimension %d does not match query secondary dimension %d", m.ID, len(m.SecondaryEmbedding), len(query.SecondaryVector))
+			}
+			secSim := cosineSimilarity(query.SecondaryVector, m.SecondaryEmbedding)
+			secSimPtr = &secSim
+		}
 		results = append(results, ScoredMemory{
-			Memory:     cloneMemory(m),
-			Distance:   dist,
-			Similarity: &sim,
+			Memory:              cloneMemory(m),
+			Distance:            dist,
+			Similarity:          &sim,
+			SecondarySimilarity: secSimPtr,
 		})
 	}
 	slices.SortFunc(results, func(a, b ScoredMemory) int {
@@ -312,7 +346,7 @@ func (s *HNSWStore) Import(r io.Reader) error {
 	if err := json.Unmarshal(encoded, &memories); err != nil {
 		return fmt.Errorf("braingate: decode memories: %w", err)
 	}
-	memDim, err := validateMemories(memories)
+	memDim, secDim, err := validateMemories(memories)
 	if err != nil {
 		return err
 	}
@@ -335,6 +369,7 @@ func (s *HNSWStore) Import(r io.Reader) error {
 	s.memories = memMap
 	s.index = idx
 	s.dims = int(dims)
+	s.secondaryDims = secDim
 	return nil
 }
 

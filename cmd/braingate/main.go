@@ -18,33 +18,39 @@ import (
 	"github.com/snowmerak/decisions"
 )
 
-const usage = "usage: braingate -spec <file> [-persona <text>] [-context <text>] [-depth <n>] [-pool-size <n>] [-min-p <ratio>] [-now <RFC3339>] [-store hnsw|qdrant] [-qdrant-url <url>] [-qdrant-collection <name>] [-embed-url <url>] [-embed-model <name>] [-no-embed] [-seed <n>] <stimulus>"
+const usage = "usage: braingate -spec <file> [-persona <text>] [-context <text>] [-depth <n>] [-pool-size <n>] [-min-p <ratio>] [-now <RFC3339>] [-store hnsw|qdrant] [-qdrant-url <url>] [-qdrant-collection <name>] [-embed-url <url>] [-embed-model <name>] [-secondary-embed-url <url>] [-secondary-embed-model <name>] [-no-embed] [-no-secondary-embed] [-seed <n>] <stimulus>"
 
 type cliOptions struct {
-	specPath         string
-	stimulus         string
-	persona          string
-	personaSet       bool
-	previousContext  string
-	depth            int
-	depthSet         bool
-	poolSize         int
-	poolSizeSet      bool
-	minP             float64
-	minPSet          bool
-	now              string
-	store            string
-	qdrantURL        string
-	qdrantCollection string
-	embedURL         string
-	embedModel       string
-	noEmbed          bool
-	seed             *int64
+	specPath             string
+	stimulus             string
+	persona              string
+	personaSet           bool
+	previousContext      string
+	depth                int
+	depthSet             bool
+	poolSize             int
+	poolSizeSet          bool
+	minP                 float64
+	minPSet              bool
+	now                  string
+	store                string
+	qdrantURL            string
+	qdrantCollection     string
+	embedURL             string
+	embedModel           string
+	secondaryEmbedURL    string
+	secondaryEmbedURLSet bool
+	secondaryEmbedModel  string
+	noEmbed              bool
+	noSecondaryEmbed     bool
+	seed                 *int64
 }
 
 func main() {
 	defaultEmbedURL := envOrDefault("BRAINGATE_EMBED_URL", braingate.DefaultEmbedBaseURL)
 	defaultEmbedModel := envOrDefault("BRAINGATE_EMBED_MODEL", braingate.DefaultEmbedModel)
+	defaultSecondaryEmbedURL := strings.TrimSpace(os.Getenv("BRAINGATE_SECONDARY_EMBED_URL"))
+	defaultSecondaryEmbedModel := envOrDefault("BRAINGATE_SECONDARY_EMBED_MODEL", braingate.DefaultSecondaryEmbedModel)
 	defaultStore := envOrDefault("BRAINGATE_STORE", "hnsw")
 	defaultQdrantURL := envOrDefault("BRAINGATE_QDRANT_URL", braingate.DefaultQdrantBaseURL)
 	defaultQdrantCollection := envOrDefault("BRAINGATE_QDRANT_COLLECTION", braingate.DefaultQdrantCollection)
@@ -61,7 +67,10 @@ func main() {
 	qdrantCollection := flag.String("qdrant-collection", defaultQdrantCollection, "Qdrant collection name")
 	embedURL := flag.String("embed-url", defaultEmbedURL, "OpenAI-compatible embeddings base URL")
 	embedModel := flag.String("embed-model", defaultEmbedModel, "embedding model name")
+	secondaryEmbedURL := flag.String("secondary-embed-url", defaultSecondaryEmbedURL, "secondary OpenAI-compatible embeddings base URL (defaults to -embed-url)")
+	secondaryEmbedModel := flag.String("secondary-embed-model", defaultSecondaryEmbedModel, "secondary embedding model name (empty to disable)")
 	noEmbed := flag.Bool("no-embed", false, "disable embeddings and rank candidates by affect distance only")
+	noSecondaryEmbed := flag.Bool("no-secondary-embed", false, "disable secondary embedding calibration")
 	seed := flag.Int64("seed", 0, "optional PRNG seed for deterministic pool sampling")
 	flag.Usage = func() {
 		_, _ = fmt.Fprintln(flag.CommandLine.Output(), usage)
@@ -69,7 +78,7 @@ func main() {
 	}
 	flag.Parse()
 
-	var personaSet, depthSet, poolSizeSet, minPSet, seedSet bool
+	var personaSet, depthSet, poolSizeSet, minPSet, secondaryEmbedURLSet, seedSet bool
 	flag.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "persona":
@@ -80,30 +89,36 @@ func main() {
 			poolSizeSet = true
 		case "min-p":
 			minPSet = true
+		case "secondary-embed-url":
+			secondaryEmbedURLSet = true
 		case "seed":
 			seedSet = true
 		}
 	})
 
 	opts := cliOptions{
-		specPath:         *specPath,
-		stimulus:         strings.Join(flag.Args(), " "),
-		persona:          *personaFlag,
-		personaSet:       personaSet,
-		previousContext:  *previousContext,
-		depth:            *depth,
-		depthSet:         depthSet,
-		poolSize:         *poolSize,
-		poolSizeSet:      poolSizeSet,
-		minP:             *minPFlag,
-		minPSet:          minPSet,
-		now:              *nowFlag,
-		store:            *store,
-		qdrantURL:        *qdrantURL,
-		qdrantCollection: *qdrantCollection,
-		embedURL:         *embedURL,
-		embedModel:       *embedModel,
-		noEmbed:          *noEmbed,
+		specPath:             *specPath,
+		stimulus:             strings.Join(flag.Args(), " "),
+		persona:              *personaFlag,
+		personaSet:           personaSet,
+		previousContext:      *previousContext,
+		depth:                *depth,
+		depthSet:             depthSet,
+		poolSize:             *poolSize,
+		poolSizeSet:          poolSizeSet,
+		minP:                 *minPFlag,
+		minPSet:              minPSet,
+		now:                  *nowFlag,
+		store:                *store,
+		qdrantURL:            *qdrantURL,
+		qdrantCollection:     *qdrantCollection,
+		embedURL:             *embedURL,
+		embedModel:           *embedModel,
+		secondaryEmbedURL:    *secondaryEmbedURL,
+		secondaryEmbedURLSet: secondaryEmbedURLSet,
+		secondaryEmbedModel:  *secondaryEmbedModel,
+		noEmbed:              *noEmbed,
+		noSecondaryEmbed:     *noSecondaryEmbed,
 	}
 	if seedSet {
 		s := *seed
@@ -136,6 +151,19 @@ func run(ctx context.Context, opts cliOptions, out io.Writer) error {
 			Model:   opts.embedModel,
 		})
 	}
+	secondaryEmbedFactory := func() (braingate.Embedder, error) {
+		if opts.noEmbed || opts.noSecondaryEmbed || strings.TrimSpace(opts.secondaryEmbedModel) == "" {
+			return nil, nil
+		}
+		secURL := strings.TrimSpace(opts.secondaryEmbedURL)
+		if secURL == "" {
+			secURL = opts.embedURL
+		}
+		return braingate.NewEmbedder(braingate.EmbedConfig{
+			BaseURL: secURL,
+			Model:   opts.secondaryEmbedModel,
+		})
+	}
 	storeFactory := func(kind string) (braingate.MemoryStore, error) {
 		switch kind {
 		case "qdrant":
@@ -150,13 +178,14 @@ func run(ctx context.Context, opts cliOptions, out io.Writer) error {
 			return nil, fmt.Errorf("unsupported store %q (want hnsw or qdrant)", kind)
 		}
 	}
-	return runWith(ctx, newClientFromEnv, embedFactory, storeFactory, opts, out)
+	return runWith(ctx, newClientFromEnv, embedFactory, secondaryEmbedFactory, storeFactory, opts, out)
 }
 
 func runWith(
 	ctx context.Context,
 	getClient func() (*decisions.Client, error),
 	getEmbedder func() (braingate.Embedder, error),
+	getSecondaryEmbedder func() (braingate.Embedder, error),
 	getStore func(kind string) (braingate.MemoryStore, error),
 	opts cliOptions,
 	out io.Writer,
@@ -213,10 +242,17 @@ func runWith(
 	}
 
 	var embedder braingate.Embedder
+	var secondaryEmbedder braingate.Embedder
 	if !opts.noEmbed && getEmbedder != nil {
 		embedder, err = getEmbedder()
 		if err != nil {
 			return err
+		}
+		if !opts.noSecondaryEmbed && getSecondaryEmbedder != nil && embedder != nil {
+			secondaryEmbedder, err = getSecondaryEmbedder()
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -233,6 +269,12 @@ func runWith(
 			memories, err = braingate.EmbedMemories(ctx, embedder, memories)
 			if err != nil {
 				return err
+			}
+			if secondaryEmbedder != nil {
+				memories, err = braingate.EmbedSecondaryMemories(ctx, secondaryEmbedder, memories)
+				if err != nil {
+					return err
+				}
 			}
 		}
 		if err := store.Upsert(ctx, memories); err != nil {
@@ -258,10 +300,11 @@ func runWith(
 	}{Stimulus: opts.stimulus, Context: opts.previousContext}
 
 	result, err := engine.Run(ctx, client, decisions.Input{State: input}, braingate.RunOptions{
-		Embedder: embedder,
-		Query:    query,
-		Now:      parsedNow,
-		Rand:     rng,
+		Embedder:          embedder,
+		SecondaryEmbedder: secondaryEmbedder,
+		Query:             query,
+		Now:               parsedNow,
+		Rand:              rng,
 	})
 	if err != nil {
 		return err

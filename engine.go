@@ -65,14 +65,15 @@ type Temperament struct {
 
 // Memory represents one experience positioned on the 2D affect plane without static edges.
 type Memory struct {
-	ID         string     `json:"id"`
-	Cue        string     `json:"cue,omitempty"`
-	Position   Point      `json:"position"`
-	Experience string     `json:"experience"`
-	Alpha      float64    `json:"alpha,omitempty"`
-	Salience   float64    `json:"salience,omitempty"`
-	CreatedAt  *time.Time `json:"created_at,omitempty"`
-	Embedding  []float64  `json:"embedding,omitempty"`
+	ID                 string     `json:"id"`
+	Cue                string     `json:"cue,omitempty"`
+	Position           Point      `json:"position"`
+	Experience         string     `json:"experience"`
+	Alpha              float64    `json:"alpha,omitempty"`
+	Salience           float64    `json:"salience,omitempty"`
+	CreatedAt          *time.Time `json:"created_at,omitempty"`
+	Embedding          []float64  `json:"embedding,omitempty"`
+	SecondaryEmbedding []float64  `json:"secondary_embedding,omitempty"`
 }
 
 // Engine evaluates stimuli against a positioned memory store or inline memory slice according to an optional Persona and Temperament.
@@ -85,12 +86,13 @@ type Engine struct {
 
 // RunOptions supplies optional persona override, embedding ranking, initial mood positioning, evaluation timestamp, and deterministic randomness.
 type RunOptions struct {
-	Persona  string
-	Embedder Embedder
-	Query    string
-	Initial  *Point
-	Now      time.Time
-	Rand     *rand.Rand
+	Persona           string
+	Embedder          Embedder
+	SecondaryEmbedder Embedder
+	Query             string
+	Initial           *Point
+	Now               time.Time
+	Rand              *rand.Rand
 }
 
 // Affect represents cumulative valence, activation, and accumulated stress.
@@ -127,17 +129,18 @@ type StepState struct {
 
 // Step records one memory recall, its candidate pool, raw evaluation, and cumulative state update.
 type Step struct {
-	Depth      int        `json:"depth"`
-	Memory     string     `json:"memory"`
-	Visit      int        `json:"visit"`
-	Pool       []string   `json:"pool"`
-	Distance   float64    `json:"distance"`
-	Similarity *float64   `json:"similarity,omitempty"`
-	Decay      float64    `json:"decay"`
-	Score      float64    `json:"score"`
-	Alpha      float64    `json:"alpha"`
-	Raw        RawReading `json:"raw"`
-	State      StepState  `json:"state"`
+	Depth               int        `json:"depth"`
+	Memory              string     `json:"memory"`
+	Visit               int        `json:"visit"`
+	Pool                []string   `json:"pool"`
+	Distance            float64    `json:"distance"`
+	Similarity          *float64   `json:"similarity,omitempty"`
+	SecondarySimilarity *float64   `json:"secondary_similarity,omitempty"`
+	Decay               float64    `json:"decay"`
+	Score               float64    `json:"score"`
+	Alpha               float64    `json:"alpha"`
+	Raw                 RawReading `json:"raw"`
+	State               StepState  `json:"state"`
 }
 
 // Summary holds the final affect snapshot and termination metadata for a run.
@@ -171,11 +174,12 @@ type evaluationState struct {
 }
 
 type candidate struct {
-	memory Memory
-	dist   float64
-	cosPtr *float64
-	decay  float64
-	score  float64
+	memory    Memory
+	dist      float64
+	cosPtr    *float64
+	secCosPtr *float64
+	decay     float64
+	score     float64
 }
 
 // Run establishes the initial affect coordinate, prepares or queries the configured MemoryStore,
@@ -188,12 +192,15 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 	if client == nil {
 		return Result{}, errors.New("braingate: decisions client is required")
 	}
+	if opts.SecondaryEmbedder != nil && opts.Embedder == nil {
+		return Result{}, errors.New("braingate: primary embedder is required when secondary embedder is configured")
+	}
 
 	cfg, err := resolveTemperament(e.Temperament)
 	if err != nil {
 		return Result{}, err
 	}
-	preDim, err := validateMemories(e.Memories)
+	preDim, preSecDim, err := validateMemories(e.Memories)
 	if err != nil {
 		return Result{}, err
 	}
@@ -240,7 +247,7 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 		}, nil
 	}
 
-	store, queryVec, err := e.prepareStore(ctx, opts.Embedder, opts.Query, input.State, preDim)
+	store, queryVec, secQueryVec, err := e.prepareStore(ctx, opts.Embedder, opts.SecondaryEmbedder, opts.Query, input.State, preDim, preSecDim)
 	if err != nil {
 		return partialResult(persona, cfg, initial, current, steps), err
 	}
@@ -260,12 +267,13 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 			fetchLimit = max(cfg.PoolSize*12, 64)
 		}
 		hits, err := store.Search(ctx, SearchQuery{
-			Probe:         probe,
-			Radius:        cfg.Radius,
-			Vector:        queryVec,
-			MinSimilarity: cfg.MinSimilarity,
-			ExcludeIDs:    exclude,
-			Limit:         fetchLimit,
+			Probe:           probe,
+			Radius:          cfg.Radius,
+			Vector:          queryVec,
+			SecondaryVector: secQueryVec,
+			MinSimilarity:   cfg.MinSimilarity,
+			ExcludeIDs:      exclude,
+			Limit:           fetchLimit,
 		})
 		if err != nil {
 			return partialResult(persona, cfg, initial, current, steps), err
@@ -273,6 +281,11 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 		if len(hits) == 0 {
 			stopReason = StopNoMemory
 			break
+		}
+		if len(secQueryVec) > 0 {
+			if err := populateMissingSecondarySimilarities(ctx, opts.SecondaryEmbedder, secQueryVec, hits); err != nil {
+				return partialResult(persona, cfg, initial, current, steps), err
+			}
 		}
 
 		candidates := rerankCandidates(hits, cfg, now)
@@ -326,16 +339,17 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 		}
 
 		steps = append(steps, Step{
-			Depth:      d,
-			Memory:     chosen.memory.ID,
-			Visit:      visit,
-			Pool:       poolIDs,
-			Distance:   chosen.dist,
-			Similarity: chosen.cosPtr,
-			Decay:      chosen.decay,
-			Score:      chosen.score,
-			Alpha:      stepAlpha,
-			Raw:        raw,
+			Depth:               d,
+			Memory:              chosen.memory.ID,
+			Visit:               visit,
+			Pool:                poolIDs,
+			Distance:            chosen.dist,
+			Similarity:          chosen.cosPtr,
+			SecondarySimilarity: chosen.secCosPtr,
+			Decay:               chosen.decay,
+			Score:               chosen.score,
+			Alpha:               stepAlpha,
+			Raw:                 raw,
 			State: StepState{
 				Valence:    nextV,
 				Activation: nextA,
@@ -356,11 +370,18 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 			break
 		}
 		if len(queryVec) > 0 {
-			nextVec, err := nextMemoryQueryVector(ctx, opts.Embedder, chosen.memory, len(queryVec))
+			nextVec, err := nextMemoryVectorFor(ctx, opts.Embedder, chosen.memory, chosen.memory.Embedding, len(queryVec), "embedding")
 			if err != nil {
 				return partialResult(persona, cfg, initial, current, steps), err
 			}
 			queryVec = nextVec
+		}
+		if len(secQueryVec) > 0 {
+			nextSecVec, err := nextMemoryVectorFor(ctx, opts.SecondaryEmbedder, chosen.memory, chosen.memory.SecondaryEmbedding, len(secQueryVec), "secondary embedding")
+			if err != nil {
+				return partialResult(persona, cfg, initial, current, steps), err
+			}
+			secQueryVec = nextSecVec
 		}
 	}
 
@@ -447,44 +468,56 @@ func resolveTemperament(t Temperament) (Temperament, error) {
 	}, nil
 }
 
-func validateMemories(memories []Memory) (int, error) {
+func validateMemories(memories []Memory) (int, int, error) {
 	seen := make(map[string]struct{}, len(memories))
 	dim := 0
+	secDim := 0
 	for _, m := range memories {
 		if strings.TrimSpace(m.ID) == "" {
-			return 0, errors.New("braingate: memory ID is required")
+			return 0, 0, errors.New("braingate: memory ID is required")
 		}
 		if _, exists := seen[m.ID]; exists {
-			return 0, fmt.Errorf("braingate: duplicate memory ID %q", m.ID)
+			return 0, 0, fmt.Errorf("braingate: duplicate memory ID %q", m.ID)
 		}
 		seen[m.ID] = struct{}{}
 
 		if strings.TrimSpace(m.Experience) == "" {
-			return 0, fmt.Errorf("braingate: memory %q requires an experience", m.ID)
+			return 0, 0, fmt.Errorf("braingate: memory %q requires an experience", m.ID)
 		}
 		if err := validatePoint(m.Position); err != nil {
-			return 0, fmt.Errorf("braingate: memory %q position: %w", m.ID, err)
+			return 0, 0, fmt.Errorf("braingate: memory %q position: %w", m.ID, err)
 		}
 		if m.Alpha != 0 && !validAlpha(m.Alpha) {
-			return 0, fmt.Errorf("braingate: memory %q alpha must be in (0, 1], got %v", m.ID, m.Alpha)
+			return 0, 0, fmt.Errorf("braingate: memory %q alpha must be in (0, 1], got %v", m.ID, m.Alpha)
 		}
 		if !finite(m.Salience) || m.Salience < 0 || m.Salience > 1 {
-			return 0, fmt.Errorf("braingate: memory %q salience must be in [0, 1], got %v", m.ID, m.Salience)
+			return 0, 0, fmt.Errorf("braingate: memory %q salience must be in [0, 1], got %v", m.ID, m.Salience)
 		}
-		if len(m.Embedding) > 0 {
-			if dim == 0 {
-				dim = len(m.Embedding)
-			} else if len(m.Embedding) != dim {
-				return 0, fmt.Errorf("braingate: memory %q embedding dimension %d does not match %d", m.ID, len(m.Embedding), dim)
-			}
-			for _, v := range m.Embedding {
-				if !finite(v) {
-					return 0, fmt.Errorf("braingate: memory %q embedding contains non-finite value", m.ID)
-				}
-			}
+		if err := validateMemoryVector(m.ID, "embedding", m.Embedding, &dim); err != nil {
+			return 0, 0, err
+		}
+		if err := validateMemoryVector(m.ID, "secondary embedding", m.SecondaryEmbedding, &secDim); err != nil {
+			return 0, 0, err
 		}
 	}
-	return dim, nil
+	return dim, secDim, nil
+}
+
+func validateMemoryVector(id, label string, vec []float64, dim *int) error {
+	if len(vec) == 0 {
+		return nil
+	}
+	if *dim == 0 {
+		*dim = len(vec)
+	} else if len(vec) != *dim {
+		return fmt.Errorf("braingate: memory %q %s dimension %d does not match %d", id, label, len(vec), *dim)
+	}
+	for _, v := range vec {
+		if !finite(v) {
+			return fmt.Errorf("braingate: memory %q %s contains non-finite value", id, label)
+		}
+	}
+	return nil
 }
 
 func validatePoint(p Point) error {
@@ -532,21 +565,28 @@ func resolveInitial(ctx context.Context, client *decisions.Client, input decisio
 	}, nil
 }
 
-func (e *Engine) prepareStore(ctx context.Context, embedder Embedder, queryOverride string, inputState any, preDim int) (MemoryStore, []float64, error) {
+func (e *Engine) prepareStore(ctx context.Context, embedder, secondaryEmbedder Embedder, queryOverride string, inputState any, preDim, preSecDim int) (MemoryStore, []float64, []float64, error) {
 	if e.Store != nil {
 		if embedder == nil {
-			return e.Store, nil, nil
+			return e.Store, nil, nil, nil
 		}
 		queryVec, err := prepareQueryEmbedding(ctx, embedder, queryOverride, inputState)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		return e.Store, queryVec, nil
+		var secQueryVec []float64
+		if secondaryEmbedder != nil {
+			secQueryVec, err = prepareQueryEmbedding(ctx, secondaryEmbedder, queryOverride, inputState)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+		}
+		return e.Store, queryVec, secQueryVec, nil
 	}
 
 	hnswStore := NewHNSWStore(HNSWConfig{})
 	if len(e.Memories) == 0 {
-		return hnswStore, nil, nil
+		return hnswStore, nil, nil, nil
 	}
 
 	memories := make([]Memory, len(e.Memories))
@@ -554,23 +594,37 @@ func (e *Engine) prepareStore(ctx context.Context, embedder Embedder, queryOverr
 		memories[i] = cloneMemory(m)
 	}
 
-	var queryVec []float64
+	var queryVec, secQueryVec []float64
 	if embedder != nil {
 		var memVecs [][]float64
 		var err error
-		queryVec, memVecs, err = prepareEmbeddings(ctx, embedder, queryOverride, inputState, e.Memories, preDim)
+		queryVec, memVecs, err = prepareEmbeddingsFor(ctx, embedder, queryOverride, inputState, e.Memories, preDim, "embedding", func(m Memory) []float64 {
+			return m.Embedding
+		})
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		for i := range memories {
 			memories[i].Embedding = slices.Clone(memVecs[i])
 		}
+		if secondaryEmbedder != nil {
+			var secVecs [][]float64
+			secQueryVec, secVecs, err = prepareEmbeddingsFor(ctx, secondaryEmbedder, queryOverride, inputState, e.Memories, preSecDim, "secondary embedding", func(m Memory) []float64 {
+				return m.SecondaryEmbedding
+			})
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			for i := range memories {
+				memories[i].SecondaryEmbedding = slices.Clone(secVecs[i])
+			}
+		}
 	}
 
 	if err := hnswStore.Upsert(ctx, memories); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return hnswStore, queryVec, nil
+	return hnswStore, queryVec, secQueryVec, nil
 }
 
 func prepareQueryEmbedding(ctx context.Context, embedder Embedder, queryOverride string, inputState any) ([]float64, error) {
@@ -593,29 +647,83 @@ func prepareQueryEmbedding(ctx context.Context, embedder Embedder, queryOverride
 	return vecs[0], nil
 }
 
-func nextMemoryQueryVector(ctx context.Context, embedder Embedder, m Memory, expectedDim int) ([]float64, error) {
-	if len(m.Embedding) > 0 {
-		if len(m.Embedding) != expectedDim {
-			return nil, fmt.Errorf("braingate: memory %q embedding dimension %d does not match query dimension %d", m.ID, len(m.Embedding), expectedDim)
+func nextMemoryVectorFor(ctx context.Context, embedder Embedder, m Memory, storedVec []float64, expectedDim int, label string) ([]float64, error) {
+	if len(storedVec) > 0 {
+		if len(storedVec) != expectedDim {
+			return nil, fmt.Errorf("braingate: memory %q %s dimension %d does not match query dimension %d", m.ID, label, len(storedVec), expectedDim)
 		}
-		for _, v := range m.Embedding {
+		for _, v := range storedVec {
 			if !finite(v) {
-				return nil, fmt.Errorf("braingate: memory %q embedding contains non-finite value", m.ID)
+				return nil, fmt.Errorf("braingate: memory %q %s contains non-finite value", m.ID, label)
 			}
 		}
-		return slices.Clone(m.Embedding), nil
+		return slices.Clone(storedVec), nil
 	}
 	if embedder == nil {
-		return nil, fmt.Errorf("braingate: memory %q has no embedding and embedder is nil", m.ID)
+		return nil, fmt.Errorf("braingate: memory %q has no %s and embedder is nil", m.ID, label)
 	}
 	vec, err := prepareQueryEmbedding(ctx, embedder, memoryText(m), nil)
 	if err != nil {
 		return nil, err
 	}
 	if len(vec) != expectedDim {
-		return nil, fmt.Errorf("braingate: memory %q embedding dimension %d does not match query dimension %d", m.ID, len(vec), expectedDim)
+		return nil, fmt.Errorf("braingate: memory %q %s dimension %d does not match query dimension %d", m.ID, label, len(vec), expectedDim)
 	}
 	return vec, nil
+}
+
+func populateMissingSecondarySimilarities(ctx context.Context, embedder Embedder, secQueryVec []float64, hits []ScoredMemory) error {
+	if len(secQueryVec) == 0 || len(hits) == 0 {
+		return nil
+	}
+	batch := make([]string, 0)
+	missingIdx := make([]int, 0)
+	for i := range hits {
+		if hits[i].SecondarySimilarity != nil {
+			continue
+		}
+		if vec := hits[i].Memory.SecondaryEmbedding; len(vec) > 0 {
+			if len(vec) != len(secQueryVec) {
+				return fmt.Errorf("braingate: memory %q secondary embedding dimension %d does not match query dimension %d", hits[i].Memory.ID, len(vec), len(secQueryVec))
+			}
+			for _, v := range vec {
+				if !finite(v) {
+					return fmt.Errorf("braingate: memory %q secondary embedding contains non-finite value", hits[i].Memory.ID)
+				}
+			}
+			sim := cosineSimilarity(secQueryVec, vec)
+			hits[i].SecondarySimilarity = &sim
+			continue
+		}
+		batch = append(batch, memoryText(hits[i].Memory))
+		missingIdx = append(missingIdx, i)
+	}
+	if len(missingIdx) == 0 || embedder == nil {
+		return nil
+	}
+
+	vecs, err := embedder.Embed(ctx, batch)
+	if err != nil {
+		return err
+	}
+	if len(vecs) != len(missingIdx) {
+		return fmt.Errorf("braingate: secondary embedder returned %d vectors for %d memories", len(vecs), len(missingIdx))
+	}
+	for offset, idx := range missingIdx {
+		vec := vecs[offset]
+		if len(vec) != len(secQueryVec) {
+			return fmt.Errorf("braingate: memory %q secondary embedding dimension %d does not match query dimension %d", hits[idx].Memory.ID, len(vec), len(secQueryVec))
+		}
+		for _, v := range vec {
+			if !finite(v) {
+				return fmt.Errorf("braingate: memory %q secondary embedding contains non-finite value", hits[idx].Memory.ID)
+			}
+		}
+		hits[idx].Memory.SecondaryEmbedding = slices.Clone(vec)
+		sim := cosineSimilarity(secQueryVec, vec)
+		hits[idx].SecondarySimilarity = &sim
+	}
+	return nil
 }
 
 func buildExcludeMap(lastID string, visits map[string]int, maxVisits int) map[string]bool {
@@ -638,7 +746,16 @@ func buildExcludeMap(lastID string, visits map[string]int, maxVisits int) map[st
 	return exclude
 }
 
-func prepareEmbeddings(ctx context.Context, embedder Embedder, queryOverride string, inputState any, memories []Memory, preDim int) ([]float64, [][]float64, error) {
+func prepareEmbeddingsFor(
+	ctx context.Context,
+	embedder Embedder,
+	queryOverride string,
+	inputState any,
+	memories []Memory,
+	preDim int,
+	label string,
+	get func(Memory) []float64,
+) ([]float64, [][]float64, error) {
 	queryText, err := resolveQueryText(queryOverride, inputState)
 	if err != nil {
 		return nil, nil, err
@@ -648,7 +765,7 @@ func prepareEmbeddings(ctx context.Context, embedder Embedder, queryOverride str
 	batch[0] = queryText
 	unembeddedIndices := make([]int, 0, len(memories))
 	for i, m := range memories {
-		if len(m.Embedding) == 0 {
+		if len(get(m)) == 0 {
 			batch = append(batch, memoryText(m))
 			unembeddedIndices = append(unembeddedIndices, i)
 		}
@@ -664,22 +781,27 @@ func prepareEmbeddings(ctx context.Context, embedder Embedder, queryOverride str
 
 	queryVec := vecs[0]
 	if len(queryVec) == 0 {
-		return nil, nil, errors.New("braingate: query embedding vector is empty")
+		return nil, nil, fmt.Errorf("braingate: query %s vector is empty", label)
 	}
 	if preDim > 0 && len(queryVec) != preDim {
-		return nil, nil, fmt.Errorf("braingate: query embedding dimension %d does not match precomputed memory dimension %d", len(queryVec), preDim)
+		return nil, nil, fmt.Errorf("braingate: query %s dimension %d does not match precomputed memory dimension %d", label, len(queryVec), preDim)
 	}
 
 	memVecs := make([][]float64, len(memories))
 	for i, m := range memories {
-		if len(m.Embedding) > 0 {
-			memVecs[i] = m.Embedding
+		if v := get(m); len(v) > 0 {
+			memVecs[i] = v
 		}
 	}
 	for offset, memIdx := range unembeddedIndices {
 		memVecs[memIdx] = vecs[offset+1]
 		if len(memVecs[memIdx]) != len(queryVec) {
-			return nil, nil, fmt.Errorf("braingate: memory %q embedding dimension %d does not match query dimension %d", memories[memIdx].ID, len(memVecs[memIdx]), len(queryVec))
+			return nil, nil, fmt.Errorf("braingate: memory %q %s dimension %d does not match query dimension %d", memories[memIdx].ID, label, len(memVecs[memIdx]), len(queryVec))
+		}
+		for _, v := range memVecs[memIdx] {
+			if !finite(v) {
+				return nil, nil, fmt.Errorf("braingate: memory %q %s contains non-finite value", memories[memIdx].ID, label)
+			}
 		}
 	}
 	return queryVec, memVecs, nil
@@ -713,47 +835,41 @@ func memoryText(m Memory) string {
 	return m.Experience
 }
 
+const (
+	minSemanticSpread = 0.05
+	logisticSteepness = 6.0
+)
+
 func rerankCandidates(hits []ScoredMemory, cfg Temperament, now time.Time) []candidate {
-	var minCos, maxCos float64
-	hasAnySim := false
-	for _, h := range hits {
-		if h.Similarity == nil {
-			continue
-		}
-		c := *h.Similarity
-		if !hasAnySim || c < minCos {
-			minCos = c
-		}
-		if !hasAnySim || c > maxCos {
-			maxCos = c
-		}
-		hasAnySim = true
-	}
+	minCos1, maxCos1 := similarityRange(hits, func(h ScoredMemory) *float64 { return h.Similarity })
+	minCos2, maxCos2 := similarityRange(hits, func(h ScoredMemory) *float64 { return h.SecondarySimilarity })
 
 	candidates := make([]candidate, 0, len(hits))
 	for _, h := range hits {
 		spatial := clamp(1.0-h.Distance/cfg.Radius, 0, 1)
 		baseScore := spatial
-		var cosPtr *float64
+		var cosPtr, secCosPtr *float64
 		if h.Similarity != nil {
-			cos := *h.Similarity
-			semAbs := clamp((cos+1.0)/2.0, 0, 1)
-			semRel := 1.0
-			if maxCos-minCos > 1e-6 {
-				semRel = clamp((cos-minCos)/(maxCos-minCos), 0, 1)
+			cos1 := *h.Similarity
+			cosPtr = &cos1
+			sem := modelSemanticScore(cos1, minCos1, maxCos1)
+			if h.SecondarySimilarity != nil {
+				cos2 := *h.SecondarySimilarity
+				secCosPtr = &cos2
+				sem2 := modelSemanticScore(cos2, minCos2, maxCos2)
+				sem = math.Sqrt(sem * sem2)
 			}
-			sem := 0.5*semAbs + 0.5*semRel
 			baseScore = math.Sqrt(spatial * sem)
-			cosPtr = &cos
 		}
 
 		decay := memoryDecay(h.Memory, now, cfg.HalfLifeHours)
 		candidates = append(candidates, candidate{
-			memory: h.Memory,
-			dist:   h.Distance,
-			cosPtr: cosPtr,
-			decay:  decay,
-			score:  baseScore * decay,
+			memory:    h.Memory,
+			dist:      h.Distance,
+			cosPtr:    cosPtr,
+			secCosPtr: secCosPtr,
+			decay:     decay,
+			score:     baseScore * decay,
 		})
 	}
 
@@ -767,6 +883,33 @@ func rerankCandidates(hits []ScoredMemory, cfg Temperament, now time.Time) []can
 		return strings.Compare(a.memory.ID, b.memory.ID)
 	})
 	return candidates
+}
+
+func similarityRange(hits []ScoredMemory, pick func(ScoredMemory) *float64) (minCos, maxCos float64) {
+	hasAny := false
+	for _, h := range hits {
+		ptr := pick(h)
+		if ptr == nil {
+			continue
+		}
+		c := *ptr
+		if !hasAny || c < minCos {
+			minCos = c
+		}
+		if !hasAny || c > maxCos {
+			maxCos = c
+		}
+		hasAny = true
+	}
+	return minCos, maxCos
+}
+
+func modelSemanticScore(cos, minCos, maxCos float64) float64 {
+	semAbs := clamp((cos+1.0)/2.0, 0, 1)
+	effSpread := max(maxCos-minCos, minSemanticSpread)
+	rel := clamp(1.0-(maxCos-cos)/effSpread, 0, 1)
+	sig := 1.0 / (1.0 + math.Exp(-logisticSteepness*(rel-0.5)))
+	return semAbs * sig
 }
 
 func memoryDecay(m Memory, now time.Time, halfLifeHours float64) float64 {

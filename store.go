@@ -9,21 +9,23 @@ import (
 
 const defaultSearchLimit = 32
 
-// SearchQuery specifies affect-space radius filtering and optional vector similarity ranking.
+// SearchQuery specifies affect-space radius filtering and optional primary/secondary vector similarity ranking.
 type SearchQuery struct {
-	Probe         Point
-	Radius        float64
-	Vector        []float64
-	MinSimilarity float64
-	ExcludeIDs    map[string]bool
-	Limit         int
+	Probe           Point
+	Radius          float64
+	Vector          []float64
+	SecondaryVector []float64
+	MinSimilarity   float64
+	ExcludeIDs      map[string]bool
+	Limit           int
 }
 
-// ScoredMemory pairs a stored Memory with its Euclidean affect distance and optional cosine similarity.
+// ScoredMemory pairs a stored Memory with its Euclidean affect distance and optional cosine similarities.
 type ScoredMemory struct {
-	Memory     Memory
-	Distance   float64
-	Similarity *float64
+	Memory              Memory
+	Distance            float64
+	Similarity          *float64
+	SecondarySimilarity *float64
 }
 
 // MemoryStore persists and queries Memory records for Engine.Run.
@@ -33,15 +35,55 @@ type MemoryStore interface {
 	Search(ctx context.Context, query SearchQuery) ([]ScoredMemory, error)
 }
 
-// EmbedMemories validates memories and computes embeddings in one batch for any entries lacking one.
+// EmbedMemories validates memories and computes primary embeddings in one batch for any entries lacking one.
 func EmbedMemories(ctx context.Context, embedder Embedder, memories []Memory) ([]Memory, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	preDim, err := validateMemories(memories)
+	preDim, _, err := validateMemories(memories)
 	if err != nil {
 		return nil, err
 	}
+	return embedMemoryField(
+		ctx,
+		embedder,
+		memories,
+		preDim,
+		"embedding",
+		func(m Memory) []float64 { return m.Embedding },
+		func(m *Memory, vec []float64) { m.Embedding = vec },
+	)
+}
+
+// EmbedSecondaryMemories validates memories and computes secondary embeddings in one batch for entries lacking one.
+func EmbedSecondaryMemories(ctx context.Context, embedder Embedder, memories []Memory) ([]Memory, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	_, preSecDim, err := validateMemories(memories)
+	if err != nil {
+		return nil, err
+	}
+	return embedMemoryField(
+		ctx,
+		embedder,
+		memories,
+		preSecDim,
+		"secondary embedding",
+		func(m Memory) []float64 { return m.SecondaryEmbedding },
+		func(m *Memory, vec []float64) { m.SecondaryEmbedding = vec },
+	)
+}
+
+func embedMemoryField(
+	ctx context.Context,
+	embedder Embedder,
+	memories []Memory,
+	preDim int,
+	label string,
+	get func(Memory) []float64,
+	set func(*Memory, []float64),
+) ([]Memory, error) {
 	out := make([]Memory, len(memories))
 	for i, m := range memories {
 		out[i] = cloneMemory(m)
@@ -53,7 +95,7 @@ func EmbedMemories(ctx context.Context, embedder Embedder, memories []Memory) ([
 	batch := make([]string, 0, len(out))
 	indices := make([]int, 0, len(out))
 	for i, m := range out {
-		if len(m.Embedding) == 0 {
+		if len(get(m)) == 0 {
 			batch = append(batch, memoryText(m))
 			indices = append(indices, i)
 		}
@@ -62,7 +104,7 @@ func EmbedMemories(ctx context.Context, embedder Embedder, memories []Memory) ([
 		return out, nil
 	}
 	if embedder == nil {
-		return nil, errors.New("braingate: embedder is required to embed memories")
+		return nil, fmt.Errorf("braingate: embedder is required to compute %s", label)
 	}
 
 	vecs, err := embedder.Embed(ctx, batch)
@@ -77,19 +119,19 @@ func EmbedMemories(ctx context.Context, embedder Embedder, memories []Memory) ([
 	for offset, idx := range indices {
 		vec := vecs[offset]
 		if len(vec) == 0 {
-			return nil, fmt.Errorf("braingate: memory %q received empty embedding", out[idx].ID)
+			return nil, fmt.Errorf("braingate: memory %q received empty %s", out[idx].ID, label)
 		}
 		if dim == 0 {
 			dim = len(vec)
 		} else if len(vec) != dim {
-			return nil, fmt.Errorf("braingate: memory %q embedding dimension %d does not match %d", out[idx].ID, len(vec), dim)
+			return nil, fmt.Errorf("braingate: memory %q %s dimension %d does not match %d", out[idx].ID, label, len(vec), dim)
 		}
 		for _, v := range vec {
 			if !finite(v) {
-				return nil, fmt.Errorf("braingate: memory %q embedding contains non-finite value", out[idx].ID)
+				return nil, fmt.Errorf("braingate: memory %q %s contains non-finite value", out[idx].ID, label)
 			}
 		}
-		out[idx].Embedding = slices.Clone(vec)
+		set(&out[idx], slices.Clone(vec))
 	}
 	return out, nil
 }
@@ -98,6 +140,9 @@ func cloneMemory(m Memory) Memory {
 	cloned := m
 	if len(m.Embedding) > 0 {
 		cloned.Embedding = slices.Clone(m.Embedding)
+	}
+	if len(m.SecondaryEmbedding) > 0 {
+		cloned.SecondaryEmbedding = slices.Clone(m.SecondaryEmbedding)
 	}
 	if m.CreatedAt != nil {
 		ts := *m.CreatedAt
@@ -121,6 +166,11 @@ func validateSearchQuery(q SearchQuery) (int, error) {
 			if !finite(v) {
 				return 0, errors.New("braingate: search vector contains non-finite value")
 			}
+		}
+	}
+	for _, v := range q.SecondaryVector {
+		if !finite(v) {
+			return 0, errors.New("braingate: search secondary vector contains non-finite value")
 		}
 	}
 	limit := q.Limit

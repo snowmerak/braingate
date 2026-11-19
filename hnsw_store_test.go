@@ -14,13 +14,14 @@ func TestHNSWStoreUpsertSearchDeleteAndSaveLoad(t *testing.T) {
 	store := braingate.NewHNSWStore(braingate.HNSWConfig{})
 	err := store.Upsert(t.Context(), []braingate.Memory{
 		{
-			ID:         "inside_circle",
-			Cue:        "원 안 기억",
-			Position:   braingate.Point{Valence: 0.6, Activation: 0.6}, // dist from (0,0) = 0.8485 <= 1.0
-			Experience: "반경 내 호의 기억",
-			Salience:   0.75,
-			CreatedAt:  &createdAt,
-			Embedding:  []float64{1, 0, 0},
+			ID:                 "inside_circle",
+			Cue:                "원 안 기억",
+			Position:           braingate.Point{Valence: 0.6, Activation: 0.6}, // dist from (0,0) = 0.8485 <= 1.0
+			Experience:         "반경 내 호의 기억",
+			Salience:           0.75,
+			CreatedAt:          &createdAt,
+			Embedding:          []float64{1, 0, 0},
+			SecondaryEmbedding: []float64{0, 1, 0, 0},
 		},
 		{
 			ID:         "corner_outside",
@@ -52,17 +53,18 @@ func TestHNSWStoreUpsertSearchDeleteAndSaveLoad(t *testing.T) {
 	}
 
 	hits, err := store.Search(t.Context(), braingate.SearchQuery{
-		Probe:         braingate.Point{Valence: 0, Activation: 0},
-		Radius:        1.0,
-		Vector:        []float64{1, 0, 0},
-		MinSimilarity: 0.5,
-		ExcludeIDs:    map[string]bool{"excluded": true},
-		Limit:         10,
+		Probe:           braingate.Point{Valence: 0, Activation: 0},
+		Radius:          1.0,
+		Vector:          []float64{1, 0, 0},
+		SecondaryVector: []float64{0, 1, 0, 0},
+		MinSimilarity:   0.5,
+		ExcludeIDs:      map[string]bool{"excluded": true},
+		Limit:           10,
 	})
 	if err != nil {
 		t.Fatalf("Search error = %v", err)
 	}
-	if len(hits) != 1 || hits[0].Memory.ID != "inside_circle" || hits[0].Memory.Salience != 0.75 || hits[0].Memory.CreatedAt == nil || !hits[0].Memory.CreatedAt.Equal(createdAt) || hits[0].Similarity == nil || !almostEqual(*hits[0].Similarity, 1.0) {
+	if len(hits) != 1 || hits[0].Memory.ID != "inside_circle" || hits[0].Memory.Salience != 0.75 || hits[0].Memory.CreatedAt == nil || !hits[0].Memory.CreatedAt.Equal(createdAt) || hits[0].Similarity == nil || !almostEqual(*hits[0].Similarity, 1.0) || hits[0].SecondarySimilarity == nil || !almostEqual(*hits[0].SecondarySimilarity, 1.0) {
 		t.Fatalf("hits = %+v, want only [inside_circle]", hits)
 	}
 
@@ -91,17 +93,18 @@ func TestHNSWStoreUpsertSearchDeleteAndSaveLoad(t *testing.T) {
 		t.Fatalf("LoadFile error = %v", err)
 	}
 	reloadedHits, err := reloaded.Search(t.Context(), braingate.SearchQuery{
-		Probe:         braingate.Point{Valence: 0, Activation: 0},
-		Radius:        1.0,
-		Vector:        []float64{1, 0, 0},
-		MinSimilarity: 0.5,
-		ExcludeIDs:    map[string]bool{"excluded": true},
-		Limit:         10,
+		Probe:           braingate.Point{Valence: 0, Activation: 0},
+		Radius:          1.0,
+		Vector:          []float64{1, 0, 0},
+		SecondaryVector: []float64{0, 1, 0, 0},
+		MinSimilarity:   0.5,
+		ExcludeIDs:      map[string]bool{"excluded": true},
+		Limit:           10,
 	})
 	if err != nil {
 		t.Fatalf("reloaded Search error = %v", err)
 	}
-	if len(reloadedHits) != 1 || reloadedHits[0].Memory.ID != "inside_circle" || reloadedHits[0].Memory.Salience != 0.75 || reloadedHits[0].Memory.CreatedAt == nil || !reloadedHits[0].Memory.CreatedAt.Equal(createdAt) {
+	if len(reloadedHits) != 1 || reloadedHits[0].Memory.ID != "inside_circle" || reloadedHits[0].Memory.Salience != 0.75 || reloadedHits[0].Memory.CreatedAt == nil || !reloadedHits[0].Memory.CreatedAt.Equal(createdAt) || reloadedHits[0].SecondarySimilarity == nil || !almostEqual(*reloadedHits[0].SecondarySimilarity, 1.0) {
 		t.Fatalf("reloadedHits = %+v", reloadedHits)
 	}
 

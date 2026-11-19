@@ -136,6 +136,7 @@ func TestRunWithExecutesExampleSpecWithEmbedderAndSeed(t *testing.T) {
 		func() (*decisions.Client, error) { return client, nil },
 		func() (braingate.Embedder, error) { return embedder, nil },
 		nil,
+		nil,
 		cliOptions{
 			specPath:        exampleSpec,
 			stimulus:        "따뜻한 격려",
@@ -195,6 +196,10 @@ func TestRunWithNoEmbedSkipsEmbedder(t *testing.T) {
 			t.Fatal("embedder factory should not be called when noEmbed is true")
 			return nil, nil
 		},
+		func() (braingate.Embedder, error) {
+			t.Fatal("secondary embedder factory should not be called when noEmbed is true")
+			return nil, nil
+		},
 		nil,
 		cliOptions{
 			specPath: exampleSpec,
@@ -217,6 +222,55 @@ func TestRunWithNoEmbedSkipsEmbedder(t *testing.T) {
 	}
 }
 
+func TestRunWithDualEmbeddersPopulatesSecondarySimilarity(t *testing.T) {
+	exampleSpec := filepath.Join("..", "..", "examples", "immediate-response.json")
+	client := mockScoreClient(t, func(*http.Request) (float64, float64) {
+		return 4, 4
+	})
+	primaryEmbedder := stubEmbedder(func(_ context.Context, texts []string) ([][]float64, error) {
+		vecs := make([][]float64, len(texts))
+		for i := range texts {
+			vecs[i] = []float64{1, 0}
+		}
+		return vecs, nil
+	})
+	secondaryEmbedder := stubEmbedder(func(_ context.Context, texts []string) ([][]float64, error) {
+		vecs := make([][]float64, len(texts))
+		for i := range texts {
+			vecs[i] = []float64{0, 1, 0}
+		}
+		return vecs, nil
+	})
+
+	var out bytes.Buffer
+	err := runWith(
+		t.Context(),
+		func() (*decisions.Client, error) { return client, nil },
+		func() (braingate.Embedder, error) { return primaryEmbedder, nil },
+		func() (braingate.Embedder, error) { return secondaryEmbedder, nil },
+		nil,
+		cliOptions{
+			specPath: exampleSpec,
+			stimulus: "따뜻한 격려",
+			depth:    1,
+		},
+		&out,
+	)
+	if err != nil {
+		t.Fatalf("runWith dual embedder error = %v", err)
+	}
+	if !strings.Contains(out.String(), `"secondary_similarity"`) {
+		t.Fatalf("expected secondary_similarity in JSON output:\n%s", out.String())
+	}
+	var result braingate.Result
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Steps) != 1 || result.Steps[0].Similarity == nil || result.Steps[0].SecondarySimilarity == nil {
+		t.Fatalf("expected both similarity and secondary_similarity on step: %+v", result.Steps)
+	}
+}
+
 func TestRunWithQdrantStoreUpsertsAndQueries(t *testing.T) {
 	exampleSpec := filepath.Join("..", "..", "examples", "immediate-response.json")
 	client := mockScoreClient(t, func(*http.Request) (float64, float64) {
@@ -236,6 +290,7 @@ func TestRunWithQdrantStoreUpsertsAndQueries(t *testing.T) {
 		t.Context(),
 		func() (*decisions.Client, error) { return client, nil },
 		func() (braingate.Embedder, error) { return embedder, nil },
+		nil,
 		func(kind string) (braingate.MemoryStore, error) {
 			if kind != "qdrant" {
 				t.Fatalf("store kind = %q, want qdrant", kind)

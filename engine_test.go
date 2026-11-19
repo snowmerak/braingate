@@ -1050,3 +1050,95 @@ func TestEnginePersonaInjectedIntoDecisionsAndExcludedFromEmbeddings(t *testing.
 		assertPersonaFlow(t, "기본 성향", "  직설적 피드백에서 안도하는 성향  ", "직설적 피드백에서 안도하는 성향", "안도하는")
 	})
 }
+
+func TestEngineDualEmbeddingGeometricCalibrationAndChaining(t *testing.T) {
+	t.Run("secondary embedder disambiguates compressed primary similarity and chains both vectors", func(t *testing.T) {
+		engine := &braingate.Engine{
+			Temperament: braingate.Temperament{
+				Depth:         2,
+				Alpha:         0.5,
+				Deadzone:      0.1,
+				Radius:        1.0,
+				MinSimilarity: 0.3,
+				PoolSize:      2,
+				MinP:          0.7,
+				MaxVisits:     1,
+			},
+			Memories: []braingate.Memory{
+				{
+					ID:                 "distractor",
+					Position:           braingate.Point{Valence: 0.4, Activation: 0},
+					Experience:         "가깝지만 2차 임베딩상 무관한 기억",
+					Embedding:          []float64{0.74, -0.6726},
+					SecondaryEmbedding: []float64{0.2, 0, 0.9798},
+				},
+				{
+					ID:                 "true_match",
+					Position:           braingate.Point{Valence: 0.85, Activation: 0},
+					Experience:         "핵심 일치 기억",
+					Embedding:          []float64{0.76, 0.6499},
+					SecondaryEmbedding: []float64{0.85, 0.5268, 0},
+				},
+				{
+					ID:                 "chained_follow",
+					Position:           braingate.Point{Valence: 0.5, Activation: 0.5},
+					Experience:         "핵심 기억에서 이어지는 후속 기억",
+					Embedding:          []float64{0, 1},
+					SecondaryEmbedding: []float64{0, 1, 0},
+				},
+			},
+		}
+
+		primaryCalls := 0
+		primaryEmbedder := fakeEmbedder(func(_ context.Context, texts []string) ([][]float64, error) {
+			primaryCalls++
+			if !reflect.DeepEqual(texts, []string{"초기 사건"}) {
+				t.Fatalf("unexpected primary embedder batch: %v", texts)
+			}
+			return [][]float64{{1, 0}}, nil
+		})
+		secondaryCalls := 0
+		secondaryEmbedder := fakeEmbedder(func(_ context.Context, texts []string) ([][]float64, error) {
+			secondaryCalls++
+			if !reflect.DeepEqual(texts, []string{"초기 사건"}) {
+				t.Fatalf("unexpected secondary embedder batch: %v", texts)
+			}
+			return [][]float64{{1, 0, 0}}, nil
+		})
+
+		got, err := engine.Run(t.Context(), fixedScoreClient(t, 3, 3), decisions.Input{State: "초기 사건"}, braingate.RunOptions{
+			Embedder:          primaryEmbedder,
+			SecondaryEmbedder: secondaryEmbedder,
+			Initial:           &braingate.Point{Valence: 0.2, Activation: 0},
+		})
+		if err != nil {
+			t.Fatalf("Run error = %v", err)
+		}
+		if primaryCalls != 1 || secondaryCalls != 1 {
+			t.Fatalf("embedder calls = (%d, %d), want (1, 1)", primaryCalls, secondaryCalls)
+		}
+		if len(got.Steps) != 2 || got.Steps[0].Memory != "true_match" || got.Steps[1].Memory != "chained_follow" {
+			t.Fatalf("steps = %+v, want [true_match chained_follow]", got.Steps)
+		}
+		if !reflect.DeepEqual(got.Steps[0].Pool, []string{"true_match"}) {
+			t.Fatalf("step 1 pool = %v, want [true_match] (distractor pruned by dual min_p)", got.Steps[0].Pool)
+		}
+		if got.Steps[0].Similarity == nil || got.Steps[0].SecondarySimilarity == nil || got.Steps[1].Similarity == nil || got.Steps[1].SecondarySimilarity == nil {
+			t.Fatalf("expected both primary and secondary similarities recorded on steps: %+v", got.Steps)
+		}
+	})
+
+	t.Run("rejects SecondaryEmbedder without primary Embedder", func(t *testing.T) {
+		engine := &braingate.Engine{
+			Memories: []braingate.Memory{{ID: "m1", Position: braingate.Point{Valence: 0.5}, Experience: "exp"}},
+		}
+		_, err := engine.Run(t.Context(), fixedScoreClient(t, 3, 3), decisions.Input{State: "s"}, braingate.RunOptions{
+			SecondaryEmbedder: fakeEmbedder(func(context.Context, []string) ([][]float64, error) {
+				return [][]float64{{1, 0}}, nil
+			}),
+		})
+		if err == nil || !strings.Contains(err.Error(), "primary embedder is required") {
+			t.Fatalf("err = %v, want primary embedder error", err)
+		}
+	})
+}

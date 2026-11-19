@@ -124,7 +124,7 @@ func TestQdrantStoreLifecycleAndCircularRefinement(t *testing.T) {
 					"result": {
 						"points": [
 							{"id":"uuid-corner","score":0.95,"payload":{"memory_id":"corner_outside","valence":0.8,"activation":0.8,"experience":"모서리"}},
-							{"id":"uuid-valid","score":0.90,"vector":[1,0,0],"payload":{"memory_id":"inside_circle","cue":"단서","valence":-0.6,"activation":0.6,"experience":"원 안","alpha":0.4,"salience":0.85,"created_at":"2026-11-10T12:00:00Z"}},
+							{"id":"uuid-valid","score":0.90,"vector":[1,0,0],"payload":{"memory_id":"inside_circle","cue":"단서","valence":-0.6,"activation":0.6,"experience":"원 안","alpha":0.4,"salience":0.85,"created_at":"2026-11-10T12:00:00Z","secondary_embedding":[0,1,0,0]}},
 							{"id":"uuid-excl","score":0.99,"payload":{"memory_id":"excluded","valence":0.1,"activation":0.1,"experience":"제외"}}
 						]
 					},
@@ -155,7 +155,7 @@ func TestQdrantStoreLifecycleAndCircularRefinement(t *testing.T) {
 
 	createdAt := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
 	memories := []braingate.Memory{
-		{ID: "inside_circle", Cue: "단서", Position: braingate.Point{Valence: -0.6, Activation: 0.6}, Experience: "원 안", Alpha: 0.4, Salience: 0.85, CreatedAt: &createdAt, Embedding: []float64{1, 0, 0}},
+		{ID: "inside_circle", Cue: "단서", Position: braingate.Point{Valence: -0.6, Activation: 0.6}, Experience: "원 안", Alpha: 0.4, Salience: 0.85, CreatedAt: &createdAt, Embedding: []float64{1, 0, 0}, SecondaryEmbedding: []float64{0, 1, 0, 0}},
 		{ID: "corner_outside", Position: braingate.Point{Valence: 0.8, Activation: 0.8}, Experience: "모서리", Embedding: []float64{1, 0, 0}},
 	}
 	if err := store.Upsert(t.Context(), memories); err != nil {
@@ -175,17 +175,18 @@ func TestQdrantStoreLifecycleAndCircularRefinement(t *testing.T) {
 	}
 
 	hits, err := store.Search(t.Context(), braingate.SearchQuery{
-		Probe:         braingate.Point{Valence: 0, Activation: 0},
-		Radius:        1.0,
-		Vector:        []float64{1, 0, 0},
-		MinSimilarity: 0.35,
-		ExcludeIDs:    map[string]bool{"excluded": true},
-		Limit:         10,
+		Probe:           braingate.Point{Valence: 0, Activation: 0},
+		Radius:          1.0,
+		Vector:          []float64{1, 0, 0},
+		SecondaryVector: []float64{0, 1, 0, 0},
+		MinSimilarity:   0.35,
+		ExcludeIDs:      map[string]bool{"excluded": true},
+		Limit:           10,
 	})
 	if err != nil {
 		t.Fatalf("Search error = %v", err)
 	}
-	if len(hits) != 1 || hits[0].Memory.ID != "inside_circle" || hits[0].Memory.Alpha != 0.4 || hits[0].Memory.Salience != 0.85 || hits[0].Memory.CreatedAt == nil || !hits[0].Memory.CreatedAt.Equal(createdAt) || !reflect.DeepEqual(hits[0].Memory.Embedding, []float64{1, 0, 0}) || hits[0].Similarity == nil || !almostEqual(*hits[0].Similarity, 0.90) {
+	if len(hits) != 1 || hits[0].Memory.ID != "inside_circle" || hits[0].Memory.Alpha != 0.4 || hits[0].Memory.Salience != 0.85 || hits[0].Memory.CreatedAt == nil || !hits[0].Memory.CreatedAt.Equal(createdAt) || !reflect.DeepEqual(hits[0].Memory.Embedding, []float64{1, 0, 0}) || !reflect.DeepEqual(hits[0].Memory.SecondaryEmbedding, []float64{0, 1, 0, 0}) || hits[0].Similarity == nil || !almostEqual(*hits[0].Similarity, 0.90) || hits[0].SecondarySimilarity == nil || !almostEqual(*hits[0].SecondarySimilarity, 1.0) {
 		t.Fatalf("hits = %+v, want only [inside_circle]", hits)
 	}
 

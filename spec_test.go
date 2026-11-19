@@ -22,7 +22,8 @@ func TestParseSpecBuildsDefaultsAndMemories(t *testing.T) {
 				"alpha": 0.75,
 				"salience": 0.8,
 				"created_at": "2026-11-10T09:30:00Z",
-				"embedding": [0.1, 0.2]
+				"embedding": [0.1, 0.2],
+				"secondary_embedding": [0.3, 0.4, 0.5]
 			},
 			{
 				"id": "m2",
@@ -55,7 +56,7 @@ func TestParseSpecBuildsDefaultsAndMemories(t *testing.T) {
 		t.Fatalf("temperament = %+v, want %+v", engine.Temperament, wantTemp)
 	}
 	wantCreated := time.Date(2026, 11, 10, 9, 30, 0, 0, time.UTC)
-	if len(engine.Memories) != 2 || engine.Memories[0].Alpha != 0.75 || engine.Memories[0].Salience != 0.8 || engine.Memories[0].CreatedAt == nil || !engine.Memories[0].CreatedAt.Equal(wantCreated) || engine.Memories[1].CreatedAt != nil || len(engine.Memories[0].Embedding) != 2 {
+	if len(engine.Memories) != 2 || engine.Memories[0].Alpha != 0.75 || engine.Memories[0].Salience != 0.8 || engine.Memories[0].CreatedAt == nil || !engine.Memories[0].CreatedAt.Equal(wantCreated) || engine.Memories[1].CreatedAt != nil || len(engine.Memories[0].Embedding) != 2 || len(engine.Memories[0].SecondaryEmbedding) != 3 {
 		t.Fatalf("unexpected memories: %+v", engine.Memories)
 	}
 }

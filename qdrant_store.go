@@ -176,7 +176,7 @@ func (s *QdrantStore) Upsert(ctx context.Context, memories []Memory) error {
 		return nil
 	}
 
-	dim, err := validateMemories(memories)
+	dim, _, err := validateMemories(memories)
 	if err != nil {
 		return err
 	}
@@ -208,14 +208,15 @@ func (s *QdrantStore) Upsert(ctx context.Context, memories []Memory) error {
 			ID:     qdrantPointUUID(m.ID),
 			Vector: m.Embedding,
 			Payload: qdrantPayload{
-				MemoryID:   m.ID,
-				Cue:        m.Cue,
-				Valence:    m.Position.Valence,
-				Activation: m.Position.Activation,
-				Experience: m.Experience,
-				Alpha:      m.Alpha,
-				Salience:   m.Salience,
-				CreatedAt:  createdAt,
+				MemoryID:           m.ID,
+				Cue:                m.Cue,
+				Valence:            m.Position.Valence,
+				Activation:         m.Position.Activation,
+				Experience:         m.Experience,
+				Alpha:              m.Alpha,
+				Salience:           m.Salience,
+				CreatedAt:          createdAt,
+				SecondaryEmbedding: slices.Clone(m.SecondaryEmbedding),
 			},
 		})
 	}
@@ -316,11 +317,20 @@ func (s *QdrantStore) Search(ctx context.Context, query SearchQuery) ([]ScoredMe
 			if vec := parseQdrantVector(rec.Vector); len(vec) > 0 {
 				m.Embedding = vec
 			}
+			var secSimPtr *float64
+			if len(query.SecondaryVector) > 0 && len(m.SecondaryEmbedding) > 0 {
+				if len(m.SecondaryEmbedding) != len(query.SecondaryVector) {
+					return nil, fmt.Errorf("braingate: memory %q secondary embedding dimension %d does not match query secondary dimension %d", m.ID, len(m.SecondaryEmbedding), len(query.SecondaryVector))
+				}
+				secSim := cosineSimilarity(query.SecondaryVector, m.SecondaryEmbedding)
+				secSimPtr = &secSim
+			}
 			sim := clamp(rec.Score, -1, 1)
 			results = append(results, ScoredMemory{
-				Memory:     m,
-				Distance:   dist,
-				Similarity: &sim,
+				Memory:              m,
+				Distance:            dist,
+				Similarity:          &sim,
+				SecondarySimilarity: secSimPtr,
 			})
 		}
 		if len(results) > limit {
@@ -381,14 +391,15 @@ func (s *QdrantStore) Search(ctx context.Context, query SearchQuery) ([]ScoredMe
 }
 
 type qdrantPayload struct {
-	MemoryID   string  `json:"memory_id"`
-	Cue        string  `json:"cue,omitempty"`
-	Valence    float64 `json:"valence"`
-	Activation float64 `json:"activation"`
-	Experience string  `json:"experience"`
-	Alpha      float64 `json:"alpha,omitempty"`
-	Salience   float64 `json:"salience,omitempty"`
-	CreatedAt  string  `json:"created_at,omitempty"`
+	MemoryID           string    `json:"memory_id"`
+	Cue                string    `json:"cue,omitempty"`
+	Valence            float64   `json:"valence"`
+	Activation         float64   `json:"activation"`
+	Experience         string    `json:"experience"`
+	Alpha              float64   `json:"alpha,omitempty"`
+	Salience           float64   `json:"salience,omitempty"`
+	CreatedAt          string    `json:"created_at,omitempty"`
+	SecondaryEmbedding []float64 `json:"secondary_embedding,omitempty"`
 }
 
 func (p qdrantPayload) toMemory() (Memory, error) {
@@ -401,13 +412,14 @@ func (p qdrantPayload) toMemory() (Memory, error) {
 		createdAt = &parsed
 	}
 	return Memory{
-		ID:         p.MemoryID,
-		Cue:        p.Cue,
-		Position:   Point{Valence: p.Valence, Activation: p.Activation},
-		Experience: p.Experience,
-		Alpha:      p.Alpha,
-		Salience:   p.Salience,
-		CreatedAt:  createdAt,
+		ID:                 p.MemoryID,
+		Cue:                p.Cue,
+		Position:           Point{Valence: p.Valence, Activation: p.Activation},
+		Experience:         p.Experience,
+		Alpha:              p.Alpha,
+		Salience:           p.Salience,
+		CreatedAt:          createdAt,
+		SecondaryEmbedding: slices.Clone(p.SecondaryEmbedding),
 	}, nil
 }
 

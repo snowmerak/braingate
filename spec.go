@@ -32,14 +32,15 @@ type TemperamentSpec struct {
 
 // MemorySpec defines one memory entry on the 2D affect plane.
 type MemorySpec struct {
-	ID         string     `json:"id"`
-	Cue        string     `json:"cue,omitempty"`
-	Position   Point      `json:"position"`
-	Experience string     `json:"experience"`
-	Alpha      *float64   `json:"alpha,omitempty"`
-	Salience   *float64   `json:"salience,omitempty"`
-	CreatedAt  *time.Time `json:"created_at,omitempty"`
-	Embedding  []float64  `json:"embedding,omitempty"`
+	ID                 string     `json:"id"`
+	Cue                string     `json:"cue,omitempty"`
+	Position           Point      `json:"position"`
+	Experience         string     `json:"experience"`
+	Alpha              *float64   `json:"alpha,omitempty"`
+	Salience           *float64   `json:"salience,omitempty"`
+	CreatedAt          *time.Time `json:"created_at,omitempty"`
+	Embedding          []float64  `json:"embedding,omitempty"`
+	SecondaryEmbedding []float64  `json:"secondary_embedding,omitempty"`
 }
 
 // ParseSpec decodes a single JSON Spec object (rejecting unknown fields and trailing data)
@@ -93,19 +94,24 @@ func (spec Spec) Build() (*Engine, error) {
 		if len(m.Embedding) > 0 {
 			emb = append([]float64(nil), m.Embedding...)
 		}
+		var secEmb []float64
+		if len(m.SecondaryEmbedding) > 0 {
+			secEmb = append([]float64(nil), m.SecondaryEmbedding...)
+		}
 		memories = append(memories, Memory{
-			ID:         m.ID,
-			Cue:        m.Cue,
-			Position:   m.Position,
-			Experience: m.Experience,
-			Alpha:      memAlpha,
-			Salience:   memSalience,
-			CreatedAt:  createdAt,
-			Embedding:  emb,
+			ID:                 m.ID,
+			Cue:                m.Cue,
+			Position:           m.Position,
+			Experience:         m.Experience,
+			Alpha:              memAlpha,
+			Salience:           memSalience,
+			CreatedAt:          createdAt,
+			Embedding:          emb,
+			SecondaryEmbedding: secEmb,
 		})
 	}
 
-	if _, err := validateMemories(memories); err != nil {
+	if _, _, err := validateMemories(memories); err != nil {
 		return nil, err
 	}
 

@@ -16,8 +16,10 @@ import (
 const (
 	// DefaultEmbedBaseURL is the default OpenAI-compatible embeddings server address.
 	DefaultEmbedBaseURL = "http://localhost:1234/v1"
-	// DefaultEmbedModel is the default embedding model identifier.
+	// DefaultEmbedModel is the default primary embedding model identifier.
 	DefaultEmbedModel = "text-embedding-embeddinggemma-2"
+	// DefaultSecondaryEmbedModel is the default secondary embedding model identifier used for dual-embedding calibration.
+	DefaultSecondaryEmbedModel = "text-embedding-qwen3-embedding-0.6b"
 
 	maxEmbedResponseBytes = 16 << 20
 )
