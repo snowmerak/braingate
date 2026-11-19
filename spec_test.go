@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/snowmerak/braingate"
 )
@@ -18,6 +19,8 @@ func TestParseSpecBuildsDefaultsAndMemories(t *testing.T) {
 				"position": { "valence": 0.6, "activation": 0.5 },
 				"experience": "기분 좋게 응대했던 기억",
 				"alpha": 0.75,
+				"salience": 0.8,
+				"created_at": "2026-11-10T09:30:00Z",
 				"embedding": [0.1, 0.2]
 			},
 			{
@@ -34,24 +37,27 @@ func TestParseSpecBuildsDefaultsAndMemories(t *testing.T) {
 	}
 
 	wantTemp := braingate.Temperament{
-		Depth:     braingate.DefaultDepth,
-		Alpha:     braingate.DefaultAlpha,
-		Deadzone:  braingate.DefaultDeadzone,
-		PoolSize:  braingate.DefaultPoolSize,
-		MaxVisits: braingate.DefaultMaxVisits,
-		Radius:    0,
+		Depth:         braingate.DefaultDepth,
+		Alpha:         braingate.DefaultAlpha,
+		Deadzone:      braingate.DefaultDeadzone,
+		Radius:        braingate.DefaultRadius,
+		MinSimilarity: braingate.DefaultMinSimilarity,
+		PoolSize:      braingate.DefaultPoolSize,
+		MaxVisits:     braingate.DefaultMaxVisits,
+		HalfLifeHours: braingate.DefaultHalfLifeHours,
 	}
 	if engine.Temperament != wantTemp {
 		t.Fatalf("temperament = %+v, want %+v", engine.Temperament, wantTemp)
 	}
-	if len(engine.Memories) != 2 || engine.Memories[0].Alpha != 0.75 || len(engine.Memories[0].Embedding) != 2 {
+	wantCreated := time.Date(2026, 11, 10, 9, 30, 0, 0, time.UTC)
+	if len(engine.Memories) != 2 || engine.Memories[0].Alpha != 0.75 || engine.Memories[0].Salience != 0.8 || engine.Memories[0].CreatedAt == nil || !engine.Memories[0].CreatedAt.Equal(wantCreated) || engine.Memories[1].CreatedAt != nil || len(engine.Memories[0].Embedding) != 2 {
 		t.Fatalf("unexpected memories: %+v", engine.Memories)
 	}
 }
 
 func TestParseSpecPreservesExplicitZeroDeadzone(t *testing.T) {
 	const definition = `{
-		"temperament": { "deadzone": 0, "depth": 2, "radius": 1.5 },
+		"temperament": { "deadzone": 0, "depth": 2, "radius": 1.5, "min_similarity": -0.2, "half_life_hours": 0 },
 		"memories": [
 			{ "id": "m1", "position": { "valence": 0.5, "activation": 0.5 }, "experience": "기억" }
 		]
@@ -60,7 +66,7 @@ func TestParseSpecPreservesExplicitZeroDeadzone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseSpec error = %v", err)
 	}
-	if engine.Temperament.Deadzone != 0 || engine.Temperament.Depth != 2 || engine.Temperament.Radius != 1.5 {
+	if engine.Temperament.Deadzone != 0 || engine.Temperament.Depth != 2 || engine.Temperament.Radius != 1.5 || engine.Temperament.MinSimilarity != -0.2 || engine.Temperament.HalfLifeHours != 0 {
 		t.Fatalf("unexpected temperament: %+v", engine.Temperament)
 	}
 }
@@ -139,9 +145,29 @@ func TestSpecBuildValidationErrors(t *testing.T) {
 			want: "max_visits",
 		},
 		{
+			name: "radius zero",
+			spec: braingate.Spec{Temperament: braingate.TemperamentSpec{Radius: f(0)}, Memories: []braingate.MemorySpec{validMem}},
+			want: "radius",
+		},
+		{
 			name: "negative radius",
 			spec: braingate.Spec{Temperament: braingate.TemperamentSpec{Radius: f(-0.1)}, Memories: []braingate.MemorySpec{validMem}},
 			want: "radius",
+		},
+		{
+			name: "min_similarity > 1",
+			spec: braingate.Spec{Temperament: braingate.TemperamentSpec{MinSimilarity: f(1.1)}, Memories: []braingate.MemorySpec{validMem}},
+			want: "min_similarity",
+		},
+		{
+			name: "min_similarity < -1",
+			spec: braingate.Spec{Temperament: braingate.TemperamentSpec{MinSimilarity: f(-1.1)}, Memories: []braingate.MemorySpec{validMem}},
+			want: "min_similarity",
+		},
+		{
+			name: "negative half_life_hours",
+			spec: braingate.Spec{Temperament: braingate.TemperamentSpec{HalfLifeHours: f(-1)}, Memories: []braingate.MemorySpec{validMem}},
+			want: "half_life_hours",
 		},
 		{
 			name: "blank memory id",
@@ -167,6 +193,16 @@ func TestSpecBuildValidationErrors(t *testing.T) {
 			name: "memory alpha zero",
 			spec: braingate.Spec{Memories: []braingate.MemorySpec{{ID: "m1", Position: validMem.Position, Experience: "e", Alpha: f(0)}}},
 			want: "alpha",
+		},
+		{
+			name: "negative salience",
+			spec: braingate.Spec{Memories: []braingate.MemorySpec{{ID: "m1", Position: validMem.Position, Experience: "e", Salience: f(-0.1)}}},
+			want: "salience",
+		},
+		{
+			name: "salience > 1",
+			spec: braingate.Spec{Memories: []braingate.MemorySpec{{ID: "m1", Position: validMem.Position, Experience: "e", Salience: f(1.1)}}},
+			want: "salience",
 		},
 		{
 			name: "inconsistent embedding dimensions",

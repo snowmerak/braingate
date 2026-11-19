@@ -6,9 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 )
 
-// Spec defines a temperament configuration and quadrant-positioned memory pool in JSON form.
+// Spec defines a temperament configuration and positioned memory pool in JSON form.
 type Spec struct {
 	Temperament TemperamentSpec `json:"temperament,omitempty"`
 	Memories    []MemorySpec    `json:"memories"`
@@ -16,22 +17,26 @@ type Spec struct {
 
 // TemperamentSpec configures optional temperament overrides. Nil fields receive package defaults.
 type TemperamentSpec struct {
-	Depth     *int     `json:"depth,omitempty"`
-	Alpha     *float64 `json:"alpha,omitempty"`
-	Deadzone  *float64 `json:"deadzone,omitempty"`
-	PoolSize  *int     `json:"pool_size,omitempty"`
-	MaxVisits *int     `json:"max_visits,omitempty"`
-	Radius    *float64 `json:"radius,omitempty"`
+	Depth         *int     `json:"depth,omitempty"`
+	Alpha         *float64 `json:"alpha,omitempty"`
+	Deadzone      *float64 `json:"deadzone,omitempty"`
+	Radius        *float64 `json:"radius,omitempty"`
+	MinSimilarity *float64 `json:"min_similarity,omitempty"`
+	PoolSize      *int     `json:"pool_size,omitempty"`
+	MaxVisits     *int     `json:"max_visits,omitempty"`
+	HalfLifeHours *float64 `json:"half_life_hours,omitempty"`
 }
 
 // MemorySpec defines one memory entry on the 2D affect plane.
 type MemorySpec struct {
-	ID         string    `json:"id"`
-	Cue        string    `json:"cue,omitempty"`
-	Position   Point     `json:"position"`
-	Experience string    `json:"experience"`
-	Alpha      *float64  `json:"alpha,omitempty"`
-	Embedding  []float64 `json:"embedding,omitempty"`
+	ID         string     `json:"id"`
+	Cue        string     `json:"cue,omitempty"`
+	Position   Point      `json:"position"`
+	Experience string     `json:"experience"`
+	Alpha      *float64   `json:"alpha,omitempty"`
+	Salience   *float64   `json:"salience,omitempty"`
+	CreatedAt  *time.Time `json:"created_at,omitempty"`
+	Embedding  []float64  `json:"embedding,omitempty"`
 }
 
 // ParseSpec decodes a single JSON Spec object (rejecting unknown fields and trailing data)
@@ -69,6 +74,18 @@ func (spec Spec) Build() (*Engine, error) {
 			}
 			memAlpha = *m.Alpha
 		}
+		var memSalience float64
+		if m.Salience != nil {
+			if !finite(*m.Salience) || *m.Salience < 0 || *m.Salience > 1 {
+				return nil, fmt.Errorf("braingate: memory %q salience must be in [0, 1], got %v", m.ID, *m.Salience)
+			}
+			memSalience = *m.Salience
+		}
+		var createdAt *time.Time
+		if m.CreatedAt != nil {
+			ts := *m.CreatedAt
+			createdAt = &ts
+		}
 		var emb []float64
 		if len(m.Embedding) > 0 {
 			emb = append([]float64(nil), m.Embedding...)
@@ -79,6 +96,8 @@ func (spec Spec) Build() (*Engine, error) {
 			Position:   m.Position,
 			Experience: m.Experience,
 			Alpha:      memAlpha,
+			Salience:   memSalience,
+			CreatedAt:  createdAt,
 			Embedding:  emb,
 		})
 	}
@@ -134,20 +153,38 @@ func (t TemperamentSpec) build() (Temperament, error) {
 		maxVisits = *t.MaxVisits
 	}
 
-	var radius float64
+	radius := DefaultRadius
 	if t.Radius != nil {
-		if !finite(*t.Radius) || *t.Radius < 0 {
-			return Temperament{}, fmt.Errorf("braingate: radius must be >= 0, got %v", *t.Radius)
+		if !finite(*t.Radius) || *t.Radius <= 0 {
+			return Temperament{}, fmt.Errorf("braingate: radius must be > 0, got %v", *t.Radius)
 		}
 		radius = *t.Radius
 	}
 
+	minSimilarity := DefaultMinSimilarity
+	if t.MinSimilarity != nil {
+		if !finite(*t.MinSimilarity) || *t.MinSimilarity < -1 || *t.MinSimilarity > 1 {
+			return Temperament{}, fmt.Errorf("braingate: min_similarity must be in [-1, 1], got %v", *t.MinSimilarity)
+		}
+		minSimilarity = *t.MinSimilarity
+	}
+
+	halfLifeHours := DefaultHalfLifeHours
+	if t.HalfLifeHours != nil {
+		if !finite(*t.HalfLifeHours) || *t.HalfLifeHours < 0 {
+			return Temperament{}, fmt.Errorf("braingate: half_life_hours must be >= 0, got %v", *t.HalfLifeHours)
+		}
+		halfLifeHours = *t.HalfLifeHours
+	}
+
 	return Temperament{
-		Depth:     depth,
-		Alpha:     alpha,
-		Deadzone:  deadzone,
-		PoolSize:  poolSize,
-		MaxVisits: maxVisits,
-		Radius:    radius,
+		Depth:         depth,
+		Alpha:         alpha,
+		Deadzone:      deadzone,
+		Radius:        radius,
+		MinSimilarity: minSimilarity,
+		PoolSize:      poolSize,
+		MaxVisits:     maxVisits,
+		HalfLifeHours: halfLifeHours,
 	}, nil
 }

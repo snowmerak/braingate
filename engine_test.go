@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/snowmerak/braingate"
 	"github.com/snowmerak/decisions"
@@ -20,11 +21,13 @@ import (
 func TestEngineRunWithEmbedderAndRandomPoolSampling(t *testing.T) {
 	engine := &braingate.Engine{
 		Temperament: braingate.Temperament{
-			Depth:     2,
-			Alpha:     0.5,
-			Deadzone:  0.15,
-			PoolSize:  2,
-			MaxVisits: 2,
+			Depth:         2,
+			Alpha:         0.5,
+			Deadzone:      0.15,
+			Radius:        1.0,
+			MinSimilarity: 0.3,
+			PoolSize:      2,
+			MaxVisits:     2,
 		},
 		Memories: []braingate.Memory{
 			{
@@ -41,16 +44,16 @@ func TestEngineRunWithEmbedderAndRandomPoolSampling(t *testing.T) {
 				Experience: "발표를 인정받고 기뻤던 기억",
 			},
 			{
-				ID:         "mem_far_q1",
-				Cue:        "먼 1사분면 기억",
-				Position:   braingate.Point{Valence: 0.1, Activation: 0.1},
-				Experience: "사분면 내 거리가 멀고 의미도 먼 기억",
+				ID:         "mem_too_far",
+				Cue:        "정서 반경 밖 기억",
+				Position:   braingate.Point{Valence: -0.8, Activation: -0.8},
+				Experience: "의미는 같아도 정서 거리가 너무 먼 기억",
 			},
 			{
-				ID:         "mem_wrong_quadrant",
-				Cue:        "다른 사분면 방어 기억",
-				Position:   braingate.Point{Valence: -0.9, Activation: 0.9},
-				Experience: "같은 주제여도 사분면이 다르면 풀에서 제외되어야 함",
+				ID:         "mem_low_sim",
+				Cue:        "의미 유사도 미달 기억",
+				Position:   braingate.Point{Valence: 0.95, Activation: 0.95},
+				Experience: "위치는 가까워도 의미 유사도가 기준 미만인 기억",
 			},
 		},
 	}
@@ -60,19 +63,19 @@ func TestEngineRunWithEmbedderAndRandomPoolSampling(t *testing.T) {
 	embedder := fakeEmbedder(func(_ context.Context, texts []string) ([][]float64, error) {
 		embedCalls++
 		gotBatch = append([]string(nil), texts...)
-		// Batch order: [query, mem_semantic, mem_far_q1, mem_wrong_quadrant]
+		// Batch order: [query, mem_semantic, mem_too_far, mem_low_sim]
 		return [][]float64{
 			{1, 0},   // query
 			{0.9, 0}, // mem_semantic (cosine 1.0)
-			{-1, 0},  // mem_far_q1 (cosine -1.0)
-			{1, 0},   // mem_wrong_quadrant (high cosine, filtered out by quadrant!)
+			{1, 0},   // mem_too_far (high cosine, filtered out by Radius!)
+			{-1, 0},  // mem_low_sim (close position, filtered out by MinSimilarity!)
 		}, nil
 	})
 
 	// Script: Step 0 -> (+1.0, +1.0); Depth 1 -> (+0.5, +0.5); Depth 2 -> (-0.5, +1.0).
 	scores := [][2]float64{
 		{4, 4}, // initial: (+1.0, +1.0)
-		{3, 3}, // depth 1: (+0.5, +0.5) -> stays in Q1 (+/+)
+		{3, 3}, // depth 1: (+0.5, +0.5)
 		{1, 4}, // depth 2: (-0.5, +1.0)
 	}
 	calls := 0
@@ -137,6 +140,9 @@ func TestEngineRunWithEmbedderAndRandomPoolSampling(t *testing.T) {
 	if len(gotBatch) != 4 || gotBatch[0] != "발표 잘 들었어요" {
 		t.Fatalf("unexpected embed batch (preembedded memory should be skipped): %v", gotBatch)
 	}
+	if got.Temperament != engine.Temperament {
+		t.Fatalf("result temperament = %+v, want %+v", got.Temperament, engine.Temperament)
+	}
 	if got.Initial.Source != "evaluated" || !almostEqual(got.Initial.Valence, 1.0) || !almostEqual(got.Initial.Activation, 1.0) {
 		t.Fatalf("initial = %+v", got.Initial)
 	}
@@ -144,13 +150,13 @@ func TestEngineRunWithEmbedderAndRandomPoolSampling(t *testing.T) {
 		t.Fatalf("final = %+v", got.Final)
 	}
 
-	// Verify pool contains only top PoolSize (2) from Q1, never mem_wrong_quadrant.
+	// Verify pool contains only top PoolSize (2) passing Radius and MinSimilarity filters.
 	step1 := got.Steps[0]
 	if !reflect.DeepEqual(step1.Pool, []string{"mem_preembedded", "mem_semantic"}) {
 		t.Fatalf("step 1 pool = %v, want [mem_preembedded mem_semantic]", step1.Pool)
 	}
-	if step1.Similarity == nil || !almostEqual(*step1.Similarity, 1.0) {
-		t.Fatalf("step 1 similarity = %v, want 1.0", step1.Similarity)
+	if step1.Similarity == nil || !almostEqual(*step1.Similarity, 1.0) || step1.Score <= 0 || step1.Score > 1 {
+		t.Fatalf("step 1 similarity=%v score=%v", step1.Similarity, step1.Score)
 	}
 
 	// Verify immediate repeat cooldown: step 2 must not include step 1's chosen memory in its pool.
@@ -178,6 +184,77 @@ func TestEngineRunWithEmbedderAndRandomPoolSampling(t *testing.T) {
 	if !almostEqual(got.Final.Valence, 0.125) || !almostEqual(got.Final.Activation, 0.875) || !almostEqual(got.Final.Stress, delta1+delta2) {
 		t.Fatalf("final = %+v, want (0.125, 0.875, %v)", got.Final, delta1+delta2)
 	}
+}
+
+func TestEngineCrossAxisNeighborAndCutoffs(t *testing.T) {
+	memories := []braingate.Memory{
+		{
+			ID:         "cross_axis_close",
+			Position:   braingate.Point{Valence: -0.05, Activation: 0.62},
+			Experience: "축 너머 바로 인접한 기억",
+			Embedding:  []float64{1, 0},
+		},
+		{
+			ID:         "same_quadrant_far",
+			Position:   braingate.Point{Valence: 0.80, Activation: 0.80},
+			Experience: "같은 사분면이지만 반경 밖인 기억",
+			Embedding:  []float64{1, 0},
+		},
+		{
+			ID:         "close_but_unrelated",
+			Position:   braingate.Point{Valence: 0.06, Activation: 0.60},
+			Experience: "위치는 아주 가깝지만 의미가 무관한 기억",
+			Embedding:  []float64{0, 1},
+		},
+	}
+
+	embedder := fakeEmbedder(func(_ context.Context, texts []string) ([][]float64, error) {
+		if len(texts) != 1 {
+			t.Fatalf("expected only query to be embedded, got %d texts", len(texts))
+		}
+		return [][]float64{{1, 0}}, nil
+	})
+	client := fixedScoreClient(t, 3, 3)
+
+	engine := &braingate.Engine{
+		Temperament: braingate.Temperament{
+			Depth:         1,
+			Alpha:         0.5,
+			Deadzone:      0.1,
+			Radius:        0.5,
+			MinSimilarity: 0.4,
+			PoolSize:      1,
+			MaxVisits:     1,
+		},
+		Memories: memories,
+	}
+
+	got, err := engine.Run(t.Context(), client, decisions.Input{State: "자극"}, braingate.RunOptions{
+		Embedder: embedder,
+		Initial:  &braingate.Point{Valence: 0.05, Activation: 0.60},
+	})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if len(got.Steps) != 1 || got.Steps[0].Memory != "cross_axis_close" || !reflect.DeepEqual(got.Steps[0].Pool, []string{"cross_axis_close"}) {
+		t.Fatalf("expected cross_axis_close to win over far same-quadrant and unrelated close memories, got %+v", got.Steps)
+	}
+
+	t.Run("stops with no_memory when min_similarity filters all candidates", func(t *testing.T) {
+		strictEngine := *engine
+		strictEngine.Temperament.MinSimilarity = 0.99
+		strictEngine.Memories = []braingate.Memory{memories[2]} // cos = 0
+		res, err := strictEngine.Run(t.Context(), client, decisions.Input{State: "자극"}, braingate.RunOptions{
+			Embedder: embedder,
+			Initial:  &braingate.Point{Valence: 0.05, Activation: 0.60},
+		})
+		if err != nil {
+			t.Fatalf("Run error = %v", err)
+		}
+		if res.Final.StopReason != braingate.StopNoMemory || res.Final.Steps != 0 {
+			t.Fatalf("got = %+v, want StopNoMemory", res)
+		}
+	})
 }
 
 func TestEngineStopDeadzone(t *testing.T) {
@@ -322,6 +399,50 @@ func TestEnginePreservesPartialStepsOnRefusal(t *testing.T) {
 	}
 }
 
+func TestEngineWithExternalStoreOnlyEmbedsQuery(t *testing.T) {
+	store := braingate.NewHNSWStore(braingate.HNSWConfig{})
+	if err := store.Upsert(t.Context(), []braingate.Memory{
+		{
+			ID:         "ext_1",
+			Cue:        "발표 칭찬",
+			Position:   braingate.Point{Valence: 0.8, Activation: 0.7},
+			Experience: "발표를 인정받았던 기억",
+			Embedding:  []float64{1, 0},
+		},
+		{
+			ID:         "ext_2",
+			Cue:        "따뜻한 화답",
+			Position:   braingate.Point{Valence: 0.6, Activation: 0.5},
+			Experience: "기분 좋게 응대한 기억",
+			Embedding:  []float64{0.9, 0.1},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	embedCalls := 0
+	embedder := fakeEmbedder(func(_ context.Context, texts []string) ([][]float64, error) {
+		embedCalls++
+		if !reflect.DeepEqual(texts, []string{"발표 칭찬"}) {
+			t.Fatalf("expected query-only embedding batch, got %v", texts)
+		}
+		return [][]float64{{1, 0}}, nil
+	})
+	client := fixedScoreClient(t, 4, 4)
+
+	engine := &braingate.Engine{
+		Temperament: braingate.Temperament{Depth: 2, Alpha: 0.5, Deadzone: 0.1, Radius: 1.0, MinSimilarity: 0.3, PoolSize: 1, MaxVisits: 1},
+		Store:       store,
+	}
+	got, err := engine.Run(t.Context(), client, decisions.Input{State: "발표 칭찬"}, braingate.RunOptions{Embedder: embedder})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if embedCalls != 1 || got.Final.Steps != 2 || got.Final.StopReason != braingate.StopDepthReached {
+		t.Fatalf("embedCalls=%d got=%+v", embedCalls, got)
+	}
+}
+
 func TestEngineRejectsInvalidInputs(t *testing.T) {
 	client := fixedScoreClient(t, 2, 2)
 	validMem := []braingate.Memory{{ID: "m1", Position: braingate.Point{Valence: 0.5, Activation: 0.5}, Experience: "기억"}}
@@ -339,6 +460,7 @@ func TestEngineRejectsInvalidInputs(t *testing.T) {
 		{name: "invalid alpha", engine: &braingate.Engine{Temperament: braingate.Temperament{Alpha: 1.5}, Memories: validMem}, client: client, want: "alpha"},
 		{name: "invalid deadzone", engine: &braingate.Engine{Temperament: braingate.Temperament{Deadzone: 1.0}, Memories: validMem}, client: client, want: "deadzone"},
 		{name: "negative radius", engine: &braingate.Engine{Temperament: braingate.Temperament{Radius: -0.1}, Memories: validMem}, client: client, want: "radius"},
+		{name: "invalid min_similarity", engine: &braingate.Engine{Temperament: braingate.Temperament{MinSimilarity: 1.5}, Memories: validMem}, client: client, want: "min_similarity"},
 		{name: "duplicate memory id", engine: &braingate.Engine{Memories: []braingate.Memory{validMem[0], validMem[0]}}, client: client, want: "duplicate memory ID"},
 		{name: "out of range initial", engine: &braingate.Engine{Memories: validMem}, client: client, opts: braingate.RunOptions{Initial: &braingate.Point{Valence: 1.2}}, want: "initial point"},
 	}
@@ -437,4 +559,139 @@ func encodeScoreAnswer(spec *scoreAnswerSpec) map[string]any {
 
 func almostEqual(got, want float64) bool {
 	return math.Abs(got-want) <= 1e-9
+}
+
+func TestEngineTimeDecayAndSalienceAlpha(t *testing.T) {
+	now := time.Date(2026, 11, 20, 15, 0, 0, 0, time.UTC)
+	initial := &braingate.Point{Valence: 0.4, Activation: 0.4}
+
+	t.Run("recent memory outranks closer faded memory", func(t *testing.T) {
+		freshAt := now.Add(-6 * time.Hour)
+		fadedAt := now.Add(-72 * time.Hour)
+		engine := &braingate.Engine{
+			Temperament: braingate.Temperament{
+				Depth:         1,
+				Alpha:         0.5,
+				Deadzone:      0.1,
+				Radius:        1.0,
+				PoolSize:      2,
+				MaxVisits:     1,
+				HalfLifeHours: 24,
+			},
+			Memories: []braingate.Memory{
+				{ID: "faded", Position: braingate.Point{Valence: 0.4, Activation: 0.5}, Experience: "오래전 기억", CreatedAt: &fadedAt},
+				{ID: "fresh", Position: braingate.Point{Valence: 0.4, Activation: 0.6}, Experience: "방금 전 기억", CreatedAt: &freshAt},
+			},
+		}
+		got, err := engine.Run(t.Context(), fixedScoreClient(t, 4, 4), decisions.Input{State: "자극"}, braingate.RunOptions{
+			Initial: initial,
+			Now:     now,
+			Rand:    rand.New(rand.NewPCG(1, 2)),
+		})
+		if err != nil {
+			t.Fatalf("Run error = %v", err)
+		}
+		if len(got.Steps) != 1 || !reflect.DeepEqual(got.Steps[0].Pool, []string{"fresh", "faded"}) {
+			t.Fatalf("pool = %+v, want [fresh faded]", got.Steps)
+		}
+	})
+
+	t.Run("salience boosts alpha and buffers decay with floor", func(t *testing.T) {
+		runSingle := func(t *testing.T, mem braingate.Memory, halfLife float64) braingate.Step {
+			t.Helper()
+			engine := &braingate.Engine{
+				Temperament: braingate.Temperament{
+					Depth:         1,
+					Alpha:         0.5,
+					Deadzone:      0.1,
+					Radius:        1.0,
+					PoolSize:      1,
+					MaxVisits:     1,
+					HalfLifeHours: halfLife,
+				},
+				Memories: []braingate.Memory{mem},
+			}
+			got, err := engine.Run(t.Context(), fixedScoreClient(t, 4, 4), decisions.Input{State: "자극"}, braingate.RunOptions{
+				Initial: initial,
+				Now:     now,
+			})
+			if err != nil {
+				t.Fatalf("Run error = %v", err)
+			}
+			if len(got.Steps) != 1 {
+				t.Fatalf("steps = %d, want 1", len(got.Steps))
+			}
+			return got.Steps[0]
+		}
+
+		// Timeless salient memory: decay=1.0, alpha = 0.5 + 0.5*0.5*1.0 = 0.75, nextV = 0.25*0.4 + 0.75*1.0 = 0.85
+		timelessStep := runSingle(t, braingate.Memory{
+			ID: "core", Position: braingate.Point{Valence: 0.4, Activation: 0.4}, Experience: "핵심 가치", Salience: 1.0,
+		}, 24)
+		if !almostEqual(timelessStep.Decay, 1.0) || !almostEqual(timelessStep.Alpha, 0.75) || !almostEqual(timelessStep.State.Valence, 0.85) {
+			t.Fatalf("timeless salient step = %+v, want decay=1 alpha=0.75 valence=0.85", timelessStep)
+		}
+
+		// Elapsed 1x half-life with salience=0: decay=0.5, alpha=0.25, nextV = 0.75*0.4 + 0.25*1.0 = 0.55
+		t24 := now.Add(-24 * time.Hour)
+		attenuatedStep := runSingle(t, braingate.Memory{
+			ID: "plain", Position: braingate.Point{Valence: 0.4, Activation: 0.4}, Experience: "보통 기억", CreatedAt: &t24,
+		}, 24)
+		if !almostEqual(attenuatedStep.Decay, 0.5) || !almostEqual(attenuatedStep.Alpha, 0.25) || !almostEqual(attenuatedStep.State.Valence, 0.55) {
+			t.Fatalf("attenuated step = %+v, want decay=0.5 alpha=0.25 valence=0.55", attenuatedStep)
+		}
+
+		// Salience=1.0 stretches half-life 5x (24 -> 120h) and keeps floor 0.3: at 120h decay = 0.3 + 0.7*0.5 = 0.65, alpha = 0.75*0.65 = 0.4875
+		t120 := now.Add(-120 * time.Hour)
+		stretchedStep := runSingle(t, braingate.Memory{
+			ID: "salient_120h", Position: braingate.Point{Valence: 0.4, Activation: 0.4}, Experience: "강한 기억", Salience: 1.0, CreatedAt: &t120,
+		}, 24)
+		if !almostEqual(stretchedStep.Decay, 0.65) || !almostEqual(stretchedStep.Alpha, 0.4875) {
+			t.Fatalf("stretched step = %+v, want decay=0.65 alpha=0.4875", stretchedStep)
+		}
+
+		// Very old salient memory retains >= 0.3 floor.
+		ancient := now.Add(-24000 * time.Hour)
+		floorStep := runSingle(t, braingate.Memory{
+			ID: "ancient_salient", Position: braingate.Point{Valence: 0.4, Activation: 0.4}, Experience: "각인된 기억", Salience: 1.0, CreatedAt: &ancient,
+		}, 24)
+		if !almostEqual(floorStep.Decay, 0.3) || floorStep.Decay < 0.3 {
+			t.Fatalf("floor step decay = %v, want 0.3", floorStep.Decay)
+		}
+
+		// Disabled halfLifeHours=0 keeps ancient zero-salience memory at decay=1.0, alpha=0.5.
+		disabledStep := runSingle(t, braingate.Memory{
+			ID: "old_disabled", Position: braingate.Point{Valence: 0.4, Activation: 0.4}, Experience: "감쇄 비활성", CreatedAt: &ancient,
+		}, 0)
+		if !almostEqual(disabledStep.Decay, 1.0) || !almostEqual(disabledStep.Alpha, 0.5) {
+			t.Fatalf("disabled step = %+v, want decay=1 alpha=0.5", disabledStep)
+		}
+
+		// Future CreatedAt clamps decay at 1.0.
+		future := now.Add(10 * time.Hour)
+		futureStep := runSingle(t, braingate.Memory{
+			ID: "future", Position: braingate.Point{Valence: 0.4, Activation: 0.4}, Experience: "미래 타임스탬프", CreatedAt: &future,
+		}, 24)
+		if !almostEqual(futureStep.Decay, 1.0) || !almostEqual(futureStep.Alpha, 0.5) {
+			t.Fatalf("future step = %+v, want decay=1 alpha=0.5", futureStep)
+		}
+	})
+
+	t.Run("rejects invalid decay parameters", func(t *testing.T) {
+		client := fixedScoreClient(t, 2, 2)
+		badHalfLife := &braingate.Engine{
+			Temperament: braingate.Temperament{HalfLifeHours: -1},
+			Memories:    []braingate.Memory{{ID: "m1", Position: braingate.Point{}, Experience: "exp"}},
+		}
+		if _, err := badHalfLife.Run(t.Context(), client, decisions.Input{State: "s"}, braingate.RunOptions{}); err == nil || !strings.Contains(err.Error(), "half_life_hours") {
+			t.Fatalf("expected half_life_hours error, got %v", err)
+		}
+
+		badSalience := &braingate.Engine{
+			Memories: []braingate.Memory{{ID: "m1", Position: braingate.Point{}, Experience: "exp", Salience: 1.5}},
+		}
+		if _, err := badSalience.Run(t.Context(), client, decisions.Input{State: "s"}, braingate.RunOptions{}); err == nil || !strings.Contains(err.Error(), "salience") {
+			t.Fatalf("expected salience error, got %v", err)
+		}
+	})
 }

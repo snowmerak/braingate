@@ -3,69 +3,98 @@
     "depth": 4,
     "alpha": 0.5,
     "deadzone": 0.15,
+    "radius": 1.0,
+    "min_similarity": 0.35,
     "pool_size": 3,
-    "max_visits": 2
+    "max_visits": 2,
+    "half_life_hours": 720
   },
   "memories": [
     {
       "id": "warm_welcome",
       "cue": "진심 어린 칭찬과 대화를 반갑게 받아들인 기억",
       "position": { "valence": 0.75, "activation": 0.65 },
-      "experience": "상대가 내 노력을 진심으로 알아주며 대화를 청할 때 기분 좋게 화답하며 자연스럽게 가까워졌던 기억이 있다."
+      "experience": "상대가 내 노력을 진심으로 알아주며 대화를 청할 때 기분 좋게 화답하며 자연스럽게 가까워졌던 기억이 있다.",
+      "salience": 0.7,
+      "created_at": "2026-11-12T10:30:00+09:00"
     },
     {
       "id": "eager_overreach",
       "cue": "칭찬이나 호의에 성급하게 흥분해 나섰다가 민망했던 기억",
       "position": { "valence": 0.55, "activation": 0.80 },
-      "experience": "호감을 느껴 성급하게 들떠서 말을 길게 꺼냈다가, 상대의 기대와 어긋나 머쓱하고 부담을 느꼈던 기억이 있다."
+      "experience": "호감을 느껴 성급하게 들떠서 말을 길게 꺼냈다가, 상대의 기대와 어긋나 머쓱하고 부담을 느꼈던 기억이 있다.",
+      "salience": 0.55,
+      "created_at": "2026-09-25T16:20:00+09:00"
     },
     {
       "id": "shared_pride",
       "cue": "작업 성과나 발표를 인정받고 차분히 보람을 느낀 기억",
       "position": { "valence": 0.85, "activation": 0.45 },
-      "experience": "열심히 준비한 결과를 긍정적으로 평가받아 기분이 맑아지고, 다음 협업을 기꺼이 열었던 기억이 있다."
+      "experience": "열심히 준비한 결과를 긍정적으로 평가받아 기분이 맑아지고, 다음 협업을 기꺼이 열었던 기억이 있다.",
+      "salience": 0.8,
+      "created_at": "2026-11-18T14:00:00+09:00"
     },
     {
       "id": "modest_restraint",
       "cue": "호의는 고맙지만 자리와 시선 때문에 한 발 물러선 기억",
       "position": { "valence": 0.60, "activation": -0.45 },
-      "experience": "마음으로는 고맙고 반가웠지만 다른 사람들의 시선이나 상황이 조심스러워 차분하게 웃기만 하며 말을 아꼈던 기억이 있다."
+      "experience": "마음으로는 고맙고 반가웠지만 다른 사람들의 시선이나 상황이 조심스러워 차분하게 웃기만 하며 말을 아꼈던 기억이 있다.",
+      "salience": 0.85
     },
     {
       "id": "quiet_gratitude",
       "cue": "표현은 줄이고 속으로만 호감을 정리하던 기억",
       "position": { "valence": 0.35, "activation": -0.65 },
-      "experience": "호의적인 제안이 반가우면서도 바로 뛰어들기보다 혼자 의미를 되새기며 조용히 호흡을 고르던 기억이 있다."
+      "experience": "호의적인 제안이 반가우면서도 바로 뛰어들기보다 혼자 의미를 되새기며 조용히 호흡을 고르던 기억이 있다.",
+      "salience": 0.45,
+      "created_at": "2026-10-28T21:10:00+09:00"
     },
     {
       "id": "prickly_defense",
       "cue": "날 선 지적이나 압박에 즉각 방어적으로 맞섰던 기억",
       "position": { "valence": -0.65, "activation": 0.75 },
-      "experience": "상대가 내 실수나 약점을 날카롭게 파고들 때 즉각 반박하며 방어 태세를 세웠다가 분위기가 더 얼어붙었던 기억이 있다."
+      "experience": "상대가 내 실수나 약점을 날카롭게 파고들 때 즉각 반박하며 방어 태세를 세웠다가 분위기가 더 얼어붙었던 기억이 있다.",
+      "salience": 0.65,
+      "created_at": "2026-09-14T11:05:00+09:00"
     },
     {
       "id": "forced_smile_tension",
       "cue": "불편한 요구를 억지 호응으로 넘기려다 지쳤던 기억",
       "position": { "valence": -0.35, "activation": 0.40 },
-      "experience": "속으로는 불편하고 거슬리는데 겉으로 맞장구치며 대응하다가 뒤늦게 피로감과 짜증이 올라왔던 기억이 있다."
+      "experience": "속으로는 불편하고 거슬리는데 겉으로 맞장구치며 대응하다가 뒤늦게 피로감과 짜증이 올라왔던 기억이 있다.",
+      "salience": 0.2,
+      "created_at": "2026-10-03T18:40:00+09:00"
     },
     {
       "id": "boundary_assertion",
       "cue": "선 넘는 태도에 분명한 선을 그어 상황을 정리했던 기억",
       "position": { "valence": -0.50, "activation": 0.55 },
-      "experience": "불쾌감이 커질 때 감정적으로 싸우기보다 단호한 태도로 거절과 경계를 분명히 밝혀 상황을 바로잡았던 기억이 있다."
+      "experience": "불쾌감이 커질 때 감정적으로 싸우기보다 단호한 태도로 거절과 경계를 분명히 밝혀 상황을 바로잡았던 기억이 있다.",
+      "salience": 0.9
     },
     {
       "id": "silent_withdrawal",
       "cue": "부담스럽거나 위압적인 상황에서 입을 닫고 물러선 기억",
       "position": { "valence": -0.70, "activation": -0.70 },
-      "experience": "말을 섞어봤자 소모만 커질 것 같은 분위기에서는 시선을 피하고 최소한의 대답만 남긴 채 자리를 떴던 기억이 있다."
+      "experience": "말을 섞어봤자 소모만 커질 것 같은 분위기에서는 시선을 피하고 최소한의 대답만 남긴 채 자리를 떴던 기억이 있다.",
+      "salience": 0.75,
+      "created_at": "2026-09-08T17:15:00+09:00"
     },
     {
       "id": "bruised_hesitation",
       "cue": "거절이나 무안을 우려해 먼저 위축되던 기억",
       "position": { "valence": -0.40, "activation": -0.45 },
-      "experience": "상대의 말속에 숨은 평가가 신경 쓰여 하고 싶은 말을 삼키고 조심스럽게 눈치만 보았던 기억이 있다."
+      "experience": "상대의 말속에 숨은 평가가 신경 쓰여 하고 싶은 말을 삼키고 조심스럽게 눈치만 보았던 기억이 있다.",
+      "salience": 0.4,
+      "created_at": "2026-10-19T13:50:00+09:00"
+    },
+    {
+      "id": "cautious_curiosity",
+      "cue": "반가우면서도 속내가 신경 쓰여 조심스레 살폈던 기억",
+      "position": { "valence": -0.08, "activation": 0.50 },
+      "experience": "상대의 호의적인 말에 끌리면서도 문득 숨은 의도나 뒷감당이 걸려 한 번쯤 멈칫하며 눈치를 살폈던 기억이 있다.",
+      "salience": 0.25,
+      "created_at": "2026-11-05T09:45:00+09:00"
     }
   ]
 }

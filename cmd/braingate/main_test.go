@@ -49,6 +49,38 @@ func TestRunValidatesArgumentsAndEnv(t *testing.T) {
 		}
 	})
 
+	t.Run("invalid pool size", func(t *testing.T) {
+		var out bytes.Buffer
+		err := run(t.Context(), cliOptions{specPath: exampleSpec, stimulus: "자극", poolSize: -1, noEmbed: true}, &out)
+		if err == nil || !strings.Contains(err.Error(), "pool-size") {
+			t.Fatalf("err = %v, want pool-size error", err)
+		}
+	})
+
+	t.Run("explicit zero pool size", func(t *testing.T) {
+		var out bytes.Buffer
+		err := run(t.Context(), cliOptions{specPath: exampleSpec, stimulus: "자극", poolSize: 0, poolSizeSet: true, noEmbed: true}, &out)
+		if err == nil || !strings.Contains(err.Error(), "pool-size") {
+			t.Fatalf("err = %v, want pool-size error", err)
+		}
+	})
+
+	t.Run("invalid now", func(t *testing.T) {
+		var out bytes.Buffer
+		err := run(t.Context(), cliOptions{specPath: exampleSpec, stimulus: "자극", now: "not-a-timestamp", noEmbed: true}, &out)
+		if err == nil || !strings.Contains(err.Error(), "-now") {
+			t.Fatalf("err = %v, want -now error", err)
+		}
+	})
+
+	t.Run("invalid store", func(t *testing.T) {
+		var out bytes.Buffer
+		err := run(t.Context(), cliOptions{specPath: exampleSpec, stimulus: "자극", store: "postgres", noEmbed: true}, &out)
+		if err == nil || !strings.Contains(err.Error(), "unsupported store") {
+			t.Fatalf("err = %v, want unsupported store error", err)
+		}
+	})
+
 	t.Run("missing api key", func(t *testing.T) {
 		t.Setenv("TYPESAFE_API_KEY", "")
 		var out bytes.Buffer
@@ -95,11 +127,14 @@ func TestRunWithExecutesExampleSpecWithEmbedderAndSeed(t *testing.T) {
 		t.Context(),
 		func() (*decisions.Client, error) { return client, nil },
 		func() (braingate.Embedder, error) { return embedder, nil },
+		nil,
 		cliOptions{
 			specPath:        exampleSpec,
 			stimulus:        "따뜻한 격려",
 			previousContext: "회의 직후",
 			depth:           2,
+			poolSize:        2,
+			now:             "2026-11-20T15:00:00+09:00",
 			seed:            &seed,
 		},
 		&out,
@@ -115,12 +150,15 @@ func TestRunWithExecutesExampleSpecWithEmbedderAndSeed(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
 		t.Fatalf("decode CLI stdout JSON: %v\noutput:\n%s", err, out.String())
 	}
+	if result.Temperament.Depth != 2 || result.Temperament.PoolSize != 2 || result.Temperament.HalfLifeHours != braingate.DefaultHalfLifeHours {
+		t.Fatalf("temperament = %+v, want depth=2 pool_size=2 half_life_hours=%v", result.Temperament, braingate.DefaultHalfLifeHours)
+	}
 	if result.Final.StopReason != braingate.StopDepthReached || result.Final.Steps != 2 {
 		t.Fatalf("final = %+v, want depth_reached after 2 steps", result.Final)
 	}
 	for i, step := range result.Steps {
-		if step.Similarity == nil {
-			t.Fatalf("step %d missing similarity when embedder enabled", i)
+		if step.Similarity == nil || step.Score <= 0 || step.Decay <= 0 || step.Decay > 1 || step.Alpha <= 0 || step.Alpha > 1 {
+			t.Fatalf("step %d missing similarity, decay, alpha, or positive score: %+v", i, step)
 		}
 	}
 }
@@ -139,6 +177,7 @@ func TestRunWithNoEmbedSkipsEmbedder(t *testing.T) {
 			t.Fatal("embedder factory should not be called when noEmbed is true")
 			return nil, nil
 		},
+		nil,
 		cliOptions{
 			specPath: exampleSpec,
 			stimulus: "따뜻한 격려",
@@ -158,6 +197,67 @@ func TestRunWithNoEmbedSkipsEmbedder(t *testing.T) {
 	if result.Final.Steps != 1 || result.Steps[0].Similarity != nil {
 		t.Fatalf("unexpected no-embed result: %+v", result)
 	}
+}
+
+func TestRunWithQdrantStoreUpsertsAndQueries(t *testing.T) {
+	exampleSpec := filepath.Join("..", "..", "examples", "immediate-response.json")
+	client := mockScoreClient(t, func(*http.Request) (float64, float64) {
+		return 4, 4
+	})
+	embedder := stubEmbedder(func(_ context.Context, texts []string) ([][]float64, error) {
+		vecs := make([][]float64, len(texts))
+		for i := range texts {
+			vecs[i] = []float64{1, 0}
+		}
+		return vecs, nil
+	})
+	recStore := &recordingStore{inner: braingate.NewHNSWStore(braingate.HNSWConfig{})}
+
+	var out bytes.Buffer
+	err := runWith(
+		t.Context(),
+		func() (*decisions.Client, error) { return client, nil },
+		func() (braingate.Embedder, error) { return embedder, nil },
+		func(kind string) (braingate.MemoryStore, error) {
+			if kind != "qdrant" {
+				t.Fatalf("store kind = %q, want qdrant", kind)
+			}
+			return recStore, nil
+		},
+		cliOptions{
+			specPath: exampleSpec,
+			stimulus: "따뜻한 격려",
+			store:    "qdrant",
+			depth:    2,
+		},
+		&out,
+	)
+	if err != nil {
+		t.Fatalf("runWith qdrant error = %v", err)
+	}
+	if recStore.upserts != 1 || recStore.searches != 2 {
+		t.Fatalf("upserts=%d searches=%d, want 1 and 2", recStore.upserts, recStore.searches)
+	}
+}
+
+type recordingStore struct {
+	inner    braingate.MemoryStore
+	upserts  int
+	searches int
+}
+
+func (s *recordingStore) Upsert(ctx context.Context, memories []braingate.Memory) error {
+	s.upserts++
+	return s.inner.Upsert(ctx, memories)
+}
+
+func (s *recordingStore) Delete(ctx context.Context, ids []string) error {
+	return s.inner.Delete(ctx, ids)
+}
+
+func (s *recordingStore) Search(ctx context.Context, query braingate.SearchQuery) ([]braingate.ScoredMemory, error) {
+	s.searches++
+	return s.inner.Search(ctx, query)
 }
 
 type stubEmbedder func(context.Context, []string) ([][]float64, error)

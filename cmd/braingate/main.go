@@ -11,41 +11,50 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"time"
 
 	"github.com/snowmerak/braingate"
 	"github.com/snowmerak/decisions"
 )
 
-const usage = "usage: braingate -spec <file> [-context <text>] [-depth <n>] [-embed-url <url>] [-embed-model <name>] [-no-embed] [-seed <n>] <stimulus>"
+const usage = "usage: braingate -spec <file> [-context <text>] [-depth <n>] [-pool-size <n>] [-now <RFC3339>] [-store hnsw|qdrant] [-qdrant-url <url>] [-qdrant-collection <name>] [-embed-url <url>] [-embed-model <name>] [-no-embed] [-seed <n>] <stimulus>"
 
 type cliOptions struct {
-	specPath        string
-	stimulus        string
-	previousContext string
-	depth           int
-	depthSet        bool
-	embedURL        string
-	embedModel      string
-	noEmbed         bool
-	seed            *int64
+	specPath         string
+	stimulus         string
+	previousContext  string
+	depth            int
+	depthSet         bool
+	poolSize         int
+	poolSizeSet      bool
+	now              string
+	store            string
+	qdrantURL        string
+	qdrantCollection string
+	embedURL         string
+	embedModel       string
+	noEmbed          bool
+	seed             *int64
 }
 
 func main() {
-	defaultEmbedURL := strings.TrimSpace(os.Getenv("BRAINGATE_EMBED_URL"))
-	if defaultEmbedURL == "" {
-		defaultEmbedURL = braingate.DefaultEmbedBaseURL
-	}
-	defaultEmbedModel := strings.TrimSpace(os.Getenv("BRAINGATE_EMBED_MODEL"))
-	if defaultEmbedModel == "" {
-		defaultEmbedModel = braingate.DefaultEmbedModel
-	}
+	defaultEmbedURL := envOrDefault("BRAINGATE_EMBED_URL", braingate.DefaultEmbedBaseURL)
+	defaultEmbedModel := envOrDefault("BRAINGATE_EMBED_MODEL", braingate.DefaultEmbedModel)
+	defaultStore := envOrDefault("BRAINGATE_STORE", "hnsw")
+	defaultQdrantURL := envOrDefault("BRAINGATE_QDRANT_URL", braingate.DefaultQdrantBaseURL)
+	defaultQdrantCollection := envOrDefault("BRAINGATE_QDRANT_COLLECTION", braingate.DefaultQdrantCollection)
 
 	specPath := flag.String("spec", "", "memory specification in JSON")
 	previousContext := flag.String("context", "", "context preceding the stimulus")
 	depth := flag.Int("depth", 0, "override temperament descent depth")
+	poolSize := flag.Int("pool-size", 0, "override temperament candidate pool size")
+	nowFlag := flag.String("now", "", "evaluation timestamp in RFC3339 format (default: current time)")
+	store := flag.String("store", defaultStore, "memory store backend: hnsw or qdrant")
+	qdrantURL := flag.String("qdrant-url", defaultQdrantURL, "Qdrant REST base URL")
+	qdrantCollection := flag.String("qdrant-collection", defaultQdrantCollection, "Qdrant collection name")
 	embedURL := flag.String("embed-url", defaultEmbedURL, "OpenAI-compatible embeddings base URL")
 	embedModel := flag.String("embed-model", defaultEmbedModel, "embedding model name")
-	noEmbed := flag.Bool("no-embed", false, "disable embeddings and rank candidates by quadrant position only")
+	noEmbed := flag.Bool("no-embed", false, "disable embeddings and rank candidates by affect distance only")
 	seed := flag.Int64("seed", 0, "optional PRNG seed for deterministic pool sampling")
 	flag.Usage = func() {
 		_, _ = fmt.Fprintln(flag.CommandLine.Output(), usage)
@@ -53,25 +62,33 @@ func main() {
 	}
 	flag.Parse()
 
-	var depthSet, seedSet bool
+	var depthSet, poolSizeSet, seedSet bool
 	flag.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "depth":
 			depthSet = true
+		case "pool-size":
+			poolSizeSet = true
 		case "seed":
 			seedSet = true
 		}
 	})
 
 	opts := cliOptions{
-		specPath:        *specPath,
-		stimulus:        strings.Join(flag.Args(), " "),
-		previousContext: *previousContext,
-		depth:           *depth,
-		depthSet:        depthSet,
-		embedURL:        *embedURL,
-		embedModel:      *embedModel,
-		noEmbed:         *noEmbed,
+		specPath:         *specPath,
+		stimulus:         strings.Join(flag.Args(), " "),
+		previousContext:  *previousContext,
+		depth:            *depth,
+		depthSet:         depthSet,
+		poolSize:         *poolSize,
+		poolSizeSet:      poolSizeSet,
+		now:              *nowFlag,
+		store:            *store,
+		qdrantURL:        *qdrantURL,
+		qdrantCollection: *qdrantCollection,
+		embedURL:         *embedURL,
+		embedModel:       *embedModel,
+		noEmbed:          *noEmbed,
 	}
 	if seedSet {
 		s := *seed
@@ -87,6 +104,13 @@ func main() {
 	}
 }
 
+func envOrDefault(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
+}
+
 func run(ctx context.Context, opts cliOptions, out io.Writer) error {
 	embedFactory := func() (braingate.Embedder, error) {
 		if opts.noEmbed {
@@ -97,13 +121,28 @@ func run(ctx context.Context, opts cliOptions, out io.Writer) error {
 			Model:   opts.embedModel,
 		})
 	}
-	return runWith(ctx, newClientFromEnv, embedFactory, opts, out)
+	storeFactory := func(kind string) (braingate.MemoryStore, error) {
+		switch kind {
+		case "qdrant":
+			return braingate.NewQdrantStore(braingate.QdrantConfig{
+				BaseURL:    opts.qdrantURL,
+				Collection: opts.qdrantCollection,
+				APIKey:     os.Getenv("QDRANT_API_KEY"),
+			})
+		case "hnsw":
+			return braingate.NewHNSWStore(braingate.HNSWConfig{}), nil
+		default:
+			return nil, fmt.Errorf("unsupported store %q (want hnsw or qdrant)", kind)
+		}
+	}
+	return runWith(ctx, newClientFromEnv, embedFactory, storeFactory, opts, out)
 }
 
 func runWith(
 	ctx context.Context,
 	getClient func() (*decisions.Client, error),
 	getEmbedder func() (braingate.Embedder, error),
+	getStore func(kind string) (braingate.MemoryStore, error),
 	opts cliOptions,
 	out io.Writer,
 ) error {
@@ -113,6 +152,25 @@ func runWith(
 	if opts.depth < 0 || (opts.depthSet && opts.depth == 0) {
 		return errors.New("depth must be >= 1")
 	}
+	if opts.poolSize < 0 || (opts.poolSizeSet && opts.poolSize == 0) {
+		return errors.New("pool-size must be >= 1")
+	}
+	var parsedNow time.Time
+	if trimmedNow := strings.TrimSpace(opts.now); trimmedNow != "" {
+		parsed, err := time.Parse(time.RFC3339, trimmedNow)
+		if err != nil {
+			return fmt.Errorf("invalid -now timestamp %q (want RFC3339): %w", opts.now, err)
+		}
+		parsedNow = parsed
+	}
+
+	storeKind := strings.ToLower(strings.TrimSpace(opts.store))
+	if storeKind == "" {
+		storeKind = "hnsw"
+	}
+	if storeKind != "hnsw" && storeKind != "qdrant" {
+		return fmt.Errorf("unsupported store %q (want hnsw or qdrant)", opts.store)
+	}
 
 	engine, err := loadSpec(opts.specPath)
 	if err != nil {
@@ -120,6 +178,9 @@ func runWith(
 	}
 	if opts.depth > 0 {
 		engine.Temperament.Depth = opts.depth
+	}
+	if opts.poolSize > 0 {
+		engine.Temperament.PoolSize = opts.poolSize
 	}
 
 	client, err := getClient()
@@ -133,6 +194,28 @@ func runWith(
 		if err != nil {
 			return err
 		}
+	}
+
+	if storeKind == "qdrant" {
+		if getStore == nil {
+			return errors.New("store factory is required for qdrant")
+		}
+		store, err := getStore(storeKind)
+		if err != nil {
+			return err
+		}
+		memories := engine.Memories
+		if embedder != nil {
+			memories, err = braingate.EmbedMemories(ctx, embedder, memories)
+			if err != nil {
+				return err
+			}
+		}
+		if err := store.Upsert(ctx, memories); err != nil {
+			return err
+		}
+		engine.Store = store
+		engine.Memories = nil
 	}
 
 	var rng *rand.Rand
@@ -153,6 +236,7 @@ func runWith(
 	result, err := engine.Run(ctx, client, decisions.Input{State: input}, braingate.RunOptions{
 		Embedder: embedder,
 		Query:    query,
+		Now:      parsedNow,
 		Rand:     rng,
 	})
 	if err != nil {

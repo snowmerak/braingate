@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/snowmerak/decisions"
 )
@@ -20,10 +21,16 @@ const (
 	DefaultAlpha = 0.5
 	// DefaultDeadzone is the default neutral stop radius around (0, 0) used by Spec.Build when omitted.
 	DefaultDeadzone = 0.15
+	// DefaultRadius is the default Euclidean affect search radius around the current probe coordinate.
+	DefaultRadius = 1.0
+	// DefaultMinSimilarity is the default minimum cosine similarity required when embeddings are enabled in Spec.Build.
+	DefaultMinSimilarity = 0.35
 	// DefaultPoolSize is the default candidate pool size sampled uniformly at each depth step.
 	DefaultPoolSize = 3
 	// DefaultMaxVisits is the default maximum number of times a single memory may be recalled in one run.
 	DefaultMaxVisits = 2
+	// DefaultHalfLifeHours is the default memory recency half-life in hours (30 days) used by Spec.Build when omitted.
+	DefaultHalfLifeHours = 720.0
 )
 
 // StopReason describes why descent execution stopped normally.
@@ -41,37 +48,43 @@ type Point struct {
 	Activation float64 `json:"activation"`
 }
 
-// Temperament configures how deeply and sensitively the engine descends through memories.
+// Temperament configures how deeply, broadly, and sensitively the engine descends through memories.
 type Temperament struct {
-	Depth     int     `json:"depth"`
-	Alpha     float64 `json:"alpha"`
-	Deadzone  float64 `json:"deadzone"`
-	PoolSize  int     `json:"pool_size"`
-	MaxVisits int     `json:"max_visits"`
-	Radius    float64 `json:"radius,omitempty"`
+	Depth         int     `json:"depth"`
+	Alpha         float64 `json:"alpha"`
+	Deadzone      float64 `json:"deadzone"`
+	Radius        float64 `json:"radius"`
+	MinSimilarity float64 `json:"min_similarity"`
+	PoolSize      int     `json:"pool_size"`
+	MaxVisits     int     `json:"max_visits"`
+	HalfLifeHours float64 `json:"half_life_hours"`
 }
 
 // Memory represents one experience positioned on the 2D affect plane without static edges.
 type Memory struct {
-	ID         string    `json:"id"`
-	Cue        string    `json:"cue,omitempty"`
-	Position   Point     `json:"position"`
-	Experience string    `json:"experience"`
-	Alpha      float64   `json:"alpha,omitempty"`
-	Embedding  []float64 `json:"embedding,omitempty"`
+	ID         string     `json:"id"`
+	Cue        string     `json:"cue,omitempty"`
+	Position   Point      `json:"position"`
+	Experience string     `json:"experience"`
+	Alpha      float64    `json:"alpha,omitempty"`
+	Salience   float64    `json:"salience,omitempty"`
+	CreatedAt  *time.Time `json:"created_at,omitempty"`
+	Embedding  []float64  `json:"embedding,omitempty"`
 }
 
-// Engine evaluates stimuli against a quadrant-positioned memory pool according to a Temperament.
+// Engine evaluates stimuli against a positioned memory store or inline memory slice according to a Temperament.
 type Engine struct {
 	Temperament Temperament
 	Memories    []Memory
+	Store       MemoryStore
 }
 
-// RunOptions supplies optional embedding ranking, initial mood positioning, and deterministic randomness.
+// RunOptions supplies optional embedding ranking, initial mood positioning, evaluation timestamp, and deterministic randomness.
 type RunOptions struct {
 	Embedder Embedder
 	Query    string
 	Initial  *Point
+	Now      time.Time
 	Rand     *rand.Rand
 }
 
@@ -115,6 +128,9 @@ type Step struct {
 	Pool       []string   `json:"pool"`
 	Distance   float64    `json:"distance"`
 	Similarity *float64   `json:"similarity,omitempty"`
+	Decay      float64    `json:"decay"`
+	Score      float64    `json:"score"`
+	Alpha      float64    `json:"alpha"`
 	Raw        RawReading `json:"raw"`
 	State      StepState  `json:"state"`
 }
@@ -128,20 +144,12 @@ type Summary struct {
 	Steps      int        `json:"steps"`
 }
 
-// Result contains the initial baseline, final affect summary, and ordered recall steps of a run.
+// Result contains the active temperament, initial baseline, final affect summary, and ordered recall steps.
 type Result struct {
-	Initial InitialState `json:"initial"`
-	Final   Summary      `json:"final"`
-	Steps   []Step       `json:"steps"`
-}
-
-type resolvedConfig struct {
-	depth     int
-	alpha     float64
-	deadzone  float64
-	poolSize  int
-	maxVisits int
-	radius    float64
+	Temperament Temperament  `json:"temperament"`
+	Initial     InitialState `json:"initial"`
+	Final       Summary      `json:"final"`
+	Steps       []Step       `json:"steps"`
 }
 
 type evaluationState struct {
@@ -156,15 +164,16 @@ type evaluationState struct {
 }
 
 type candidate struct {
-	index  int
 	memory Memory
 	dist   float64
 	cosPtr *float64
+	decay  float64
 	score  float64
 }
 
-// Run establishes the initial affect coordinate, optionally embeds the query and unembedded memories
-// in one batch, and descends up to Temperament.Depth times by sampling from quadrant-matched pools.
+// Run establishes the initial affect coordinate, prepares or queries the configured MemoryStore,
+// and descends up to Temperament.Depth times by filtering and reranking nearby memories
+// and sampling from the top Temperament.PoolSize candidates.
 func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisions.Input, opts RunOptions) (Result, error) {
 	if e == nil {
 		return Result{}, errors.New("braingate: engine is required")
@@ -203,9 +212,10 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 	}
 	steps := []Step{}
 
-	if math.Hypot(probe.Valence, probe.Activation) <= cfg.deadzone {
+	if math.Hypot(probe.Valence, probe.Activation) <= cfg.Deadzone {
 		return Result{
-			Initial: initial,
+			Temperament: cfg,
+			Initial:     initial,
 			Final: Summary{
 				Valence:    current.Valence,
 				Activation: current.Activation,
@@ -217,27 +227,43 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 		}, nil
 	}
 
-	var queryVec []float64
-	var memVecs [][]float64
-	if opts.Embedder != nil && len(e.Memories) > 0 {
-		queryVec, memVecs, err = prepareEmbeddings(ctx, opts.Embedder, opts.Query, input.State, e.Memories, preDim)
-		if err != nil {
-			return partialResult(initial, current, steps), err
-		}
+	store, queryVec, err := e.prepareStore(ctx, opts.Embedder, opts.Query, input.State, preDim)
+	if err != nil {
+		return partialResult(cfg, initial, current, steps), err
 	}
 
-	visits := make(map[string]int, len(e.Memories))
+	visits := make(map[string]int)
 	lastMemoryID := ""
 	var stopReason StopReason
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
 
-	for d := 1; d <= cfg.depth; d++ {
-		candidates := rankCandidates(e.Memories, probe, lastMemoryID, visits, cfg, queryVec, memVecs)
-		if len(candidates) == 0 {
+	for d := 1; d <= cfg.Depth; d++ {
+		exclude := buildExcludeMap(lastMemoryID, visits, cfg.MaxVisits)
+		fetchLimit := max(cfg.PoolSize*8, defaultSearchLimit)
+		if cfg.HalfLifeHours > 0 {
+			fetchLimit = max(cfg.PoolSize*12, 64)
+		}
+		hits, err := store.Search(ctx, SearchQuery{
+			Probe:         probe,
+			Radius:        cfg.Radius,
+			Vector:        queryVec,
+			MinSimilarity: cfg.MinSimilarity,
+			ExcludeIDs:    exclude,
+			Limit:         fetchLimit,
+		})
+		if err != nil {
+			return partialResult(cfg, initial, current, steps), err
+		}
+		if len(hits) == 0 {
 			stopReason = StopNoMemory
 			break
 		}
 
-		poolLimit := min(cfg.poolSize, len(candidates))
+		candidates := rerankCandidates(hits, cfg, now)
+		poolLimit := min(cfg.PoolSize, len(candidates))
 		pool := candidates[:poolLimit]
 		poolIDs := make([]string, len(pool))
 		for i, c := range pool {
@@ -263,18 +289,19 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 			Questions: memoryQuestions(),
 		})
 		if err != nil {
-			return partialResult(initial, current, steps), fmt.Errorf("braingate: depth %d memory %q: %w", d, chosen.memory.ID, err)
+			return partialResult(cfg, initial, current, steps), fmt.Errorf("braingate: depth %d memory %q: %w", d, chosen.memory.ID, err)
 		}
 
 		raw, err := parseRawReading(resp, chosen.memory.ID)
 		if err != nil {
-			return partialResult(initial, current, steps), err
+			return partialResult(cfg, initial, current, steps), err
 		}
 
-		stepAlpha := cfg.alpha
+		baseAlpha := cfg.Alpha
 		if chosen.memory.Alpha > 0 {
-			stepAlpha = chosen.memory.Alpha
+			baseAlpha = chosen.memory.Alpha
 		}
+		stepAlpha := effectiveStepAlpha(baseAlpha, chosen.memory.Salience, chosen.decay)
 		nextV := clamp((1-stepAlpha)*current.Valence+stepAlpha*raw.Valence, -1, 1)
 		nextA := clamp((1-stepAlpha)*current.Activation+stepAlpha*raw.Activation, -1, 1)
 		delta := math.Hypot(nextV-current.Valence, nextA-current.Activation)
@@ -292,6 +319,9 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 			Pool:       poolIDs,
 			Distance:   chosen.dist,
 			Similarity: chosen.cosPtr,
+			Decay:      chosen.decay,
+			Score:      chosen.score,
+			Alpha:      stepAlpha,
 			Raw:        raw,
 			State: StepState{
 				Valence:    nextV,
@@ -304,18 +334,19 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 		probe = Point{Valence: raw.Valence, Activation: raw.Activation}
 		lastMemoryID = chosen.memory.ID
 
-		if math.Hypot(probe.Valence, probe.Activation) <= cfg.deadzone {
+		if math.Hypot(probe.Valence, probe.Activation) <= cfg.Deadzone {
 			stopReason = StopDeadzone
 			break
 		}
-		if d == cfg.depth {
+		if d == cfg.Depth {
 			stopReason = StopDepthReached
 			break
 		}
 	}
 
 	return Result{
-		Initial: initial,
+		Temperament: cfg,
+		Initial:     initial,
 		Final: Summary{
 			Valence:    current.Valence,
 			Activation: current.Activation,
@@ -327,13 +358,13 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 	}, nil
 }
 
-func resolveTemperament(t Temperament) (resolvedConfig, error) {
+func resolveTemperament(t Temperament) (Temperament, error) {
 	depth := t.Depth
 	if depth == 0 {
 		depth = DefaultDepth
 	}
 	if depth < 0 {
-		return resolvedConfig{}, fmt.Errorf("braingate: depth must be >= 1, got %d", t.Depth)
+		return Temperament{}, fmt.Errorf("braingate: depth must be >= 1, got %d", t.Depth)
 	}
 
 	alpha := t.Alpha
@@ -341,11 +372,23 @@ func resolveTemperament(t Temperament) (resolvedConfig, error) {
 		alpha = DefaultAlpha
 	}
 	if !validAlpha(alpha) {
-		return resolvedConfig{}, fmt.Errorf("braingate: alpha must be in (0, 1], got %v", t.Alpha)
+		return Temperament{}, fmt.Errorf("braingate: alpha must be in (0, 1], got %v", t.Alpha)
 	}
 
 	if !finite(t.Deadzone) || t.Deadzone < 0 || t.Deadzone >= 1 {
-		return resolvedConfig{}, fmt.Errorf("braingate: deadzone must be in [0, 1), got %v", t.Deadzone)
+		return Temperament{}, fmt.Errorf("braingate: deadzone must be in [0, 1), got %v", t.Deadzone)
+	}
+
+	radius := t.Radius
+	if radius == 0 {
+		radius = DefaultRadius
+	}
+	if !finite(radius) || radius < 0 {
+		return Temperament{}, fmt.Errorf("braingate: radius must be > 0, got %v", t.Radius)
+	}
+
+	if !finite(t.MinSimilarity) || t.MinSimilarity < -1 || t.MinSimilarity > 1 {
+		return Temperament{}, fmt.Errorf("braingate: min_similarity must be in [-1, 1], got %v", t.MinSimilarity)
 	}
 
 	poolSize := t.PoolSize
@@ -353,7 +396,7 @@ func resolveTemperament(t Temperament) (resolvedConfig, error) {
 		poolSize = DefaultPoolSize
 	}
 	if poolSize < 0 {
-		return resolvedConfig{}, fmt.Errorf("braingate: pool_size must be >= 1, got %d", t.PoolSize)
+		return Temperament{}, fmt.Errorf("braingate: pool_size must be >= 1, got %d", t.PoolSize)
 	}
 
 	maxVisits := t.MaxVisits
@@ -361,20 +404,21 @@ func resolveTemperament(t Temperament) (resolvedConfig, error) {
 		maxVisits = DefaultMaxVisits
 	}
 	if maxVisits < 0 {
-		return resolvedConfig{}, fmt.Errorf("braingate: max_visits must be >= 1, got %d", t.MaxVisits)
+		return Temperament{}, fmt.Errorf("braingate: max_visits must be >= 1, got %d", t.MaxVisits)
+	}
+	if !finite(t.HalfLifeHours) || t.HalfLifeHours < 0 {
+		return Temperament{}, fmt.Errorf("braingate: half_life_hours must be >= 0, got %v", t.HalfLifeHours)
 	}
 
-	if !finite(t.Radius) || t.Radius < 0 {
-		return resolvedConfig{}, fmt.Errorf("braingate: radius must be >= 0, got %v", t.Radius)
-	}
-
-	return resolvedConfig{
-		depth:     depth,
-		alpha:     alpha,
-		deadzone:  t.Deadzone,
-		poolSize:  poolSize,
-		maxVisits: maxVisits,
-		radius:    t.Radius,
+	return Temperament{
+		Depth:         depth,
+		Alpha:         alpha,
+		Deadzone:      t.Deadzone,
+		Radius:        radius,
+		MinSimilarity: t.MinSimilarity,
+		PoolSize:      poolSize,
+		MaxVisits:     maxVisits,
+		HalfLifeHours: t.HalfLifeHours,
 	}, nil
 }
 
@@ -398,6 +442,9 @@ func validateMemories(memories []Memory) (int, error) {
 		}
 		if m.Alpha != 0 && !validAlpha(m.Alpha) {
 			return 0, fmt.Errorf("braingate: memory %q alpha must be in (0, 1], got %v", m.ID, m.Alpha)
+		}
+		if !finite(m.Salience) || m.Salience < 0 || m.Salience > 1 {
+			return 0, fmt.Errorf("braingate: memory %q salience must be in [0, 1], got %v", m.ID, m.Salience)
 		}
 		if len(m.Embedding) > 0 {
 			if dim == 0 {
@@ -457,6 +504,87 @@ func resolveInitial(ctx context.Context, client *decisions.Client, input decisio
 		ValenceConfidence:    raw.ValenceConfidence,
 		ActivationConfidence: raw.ActivationConfidence,
 	}, nil
+}
+
+func (e *Engine) prepareStore(ctx context.Context, embedder Embedder, queryOverride string, inputState any, preDim int) (MemoryStore, []float64, error) {
+	if e.Store != nil {
+		if embedder == nil {
+			return e.Store, nil, nil
+		}
+		queryVec, err := prepareQueryEmbedding(ctx, embedder, queryOverride, inputState)
+		if err != nil {
+			return nil, nil, err
+		}
+		return e.Store, queryVec, nil
+	}
+
+	hnswStore := NewHNSWStore(HNSWConfig{})
+	if len(e.Memories) == 0 {
+		return hnswStore, nil, nil
+	}
+
+	memories := make([]Memory, len(e.Memories))
+	for i, m := range e.Memories {
+		memories[i] = cloneMemory(m)
+	}
+
+	var queryVec []float64
+	if embedder != nil {
+		var memVecs [][]float64
+		var err error
+		queryVec, memVecs, err = prepareEmbeddings(ctx, embedder, queryOverride, inputState, e.Memories, preDim)
+		if err != nil {
+			return nil, nil, err
+		}
+		for i := range memories {
+			memories[i].Embedding = slices.Clone(memVecs[i])
+		}
+	}
+
+	if err := hnswStore.Upsert(ctx, memories); err != nil {
+		return nil, nil, err
+	}
+	return hnswStore, queryVec, nil
+}
+
+func prepareQueryEmbedding(ctx context.Context, embedder Embedder, queryOverride string, inputState any) ([]float64, error) {
+	queryText, err := resolveQueryText(queryOverride, inputState)
+	if err != nil {
+		return nil, err
+	}
+	vecs, err := embedder.Embed(ctx, []string{queryText})
+	if err != nil {
+		return nil, err
+	}
+	if len(vecs) != 1 || len(vecs[0]) == 0 {
+		return nil, errors.New("braingate: query embedding vector is empty")
+	}
+	for _, v := range vecs[0] {
+		if !finite(v) {
+			return nil, errors.New("braingate: query embedding contains non-finite value")
+		}
+	}
+	return vecs[0], nil
+}
+
+func buildExcludeMap(lastID string, visits map[string]int, maxVisits int) map[string]bool {
+	var exclude map[string]bool
+	ensure := func() {
+		if exclude == nil {
+			exclude = make(map[string]bool)
+		}
+	}
+	if lastID != "" {
+		ensure()
+		exclude[lastID] = true
+	}
+	for id, count := range visits {
+		if count >= maxVisits {
+			ensure()
+			exclude[id] = true
+		}
+	}
+	return exclude
 }
 
 func prepareEmbeddings(ctx context.Context, embedder Embedder, queryOverride string, inputState any, memories []Memory, preDim int) ([]float64, [][]float64, error) {
@@ -534,41 +662,47 @@ func memoryText(m Memory) string {
 	return m.Experience
 }
 
-func rankCandidates(memories []Memory, probe Point, lastID string, visits map[string]int, cfg resolvedConfig, queryVec []float64, memVecs [][]float64) []candidate {
-	candidates := make([]candidate, 0, len(memories))
-	maxDiag := 2.0 * math.Sqrt2
+func rerankCandidates(hits []ScoredMemory, cfg Temperament, now time.Time) []candidate {
+	var minCos, maxCos float64
+	hasAnySim := false
+	for _, h := range hits {
+		if h.Similarity == nil {
+			continue
+		}
+		c := *h.Similarity
+		if !hasAnySim || c < minCos {
+			minCos = c
+		}
+		if !hasAnySim || c > maxCos {
+			maxCos = c
+		}
+		hasAnySim = true
+	}
 
-	for i, m := range memories {
-		if m.ID == lastID {
-			continue
-		}
-		if visits[m.ID] >= cfg.maxVisits {
-			continue
-		}
-		if !sameQuadrant(probe, m.Position) {
-			continue
-		}
-		dist := math.Hypot(probe.Valence-m.Position.Valence, probe.Activation-m.Position.Activation)
-		if cfg.radius > 0 && dist > cfg.radius {
-			continue
-		}
-
-		spatial := clamp(1.0-dist/maxDiag, 0, 1)
-		score := spatial
+	candidates := make([]candidate, 0, len(hits))
+	for _, h := range hits {
+		spatial := clamp(1.0-h.Distance/cfg.Radius, 0, 1)
+		baseScore := spatial
 		var cosPtr *float64
-		if len(queryVec) > 0 {
-			cos := cosineSimilarity(queryVec, memVecs[i])
-			sem := clamp((cos+1.0)/2.0, 0, 1)
-			score = 0.5*spatial + 0.5*sem
+		if h.Similarity != nil {
+			cos := *h.Similarity
+			semAbs := clamp((cos+1.0)/2.0, 0, 1)
+			semRel := 1.0
+			if maxCos-minCos > 1e-6 {
+				semRel = clamp((cos-minCos)/(maxCos-minCos), 0, 1)
+			}
+			sem := 0.5*semAbs + 0.5*semRel
+			baseScore = math.Sqrt(spatial * sem)
 			cosPtr = &cos
 		}
 
+		decay := memoryDecay(h.Memory, now, cfg.HalfLifeHours)
 		candidates = append(candidates, candidate{
-			index:  i,
-			memory: m,
-			dist:   dist,
+			memory: h.Memory,
+			dist:   h.Distance,
 			cosPtr: cosPtr,
-			score:  score,
+			decay:  decay,
+			score:  baseScore * decay,
 		})
 	}
 
@@ -584,8 +718,24 @@ func rankCandidates(memories []Memory, probe Point, lastID string, visits map[st
 	return candidates
 }
 
-func sameQuadrant(a, b Point) bool {
-	return (a.Valence >= 0) == (b.Valence >= 0) && (a.Activation >= 0) == (b.Activation >= 0)
+func memoryDecay(m Memory, now time.Time, halfLifeHours float64) float64 {
+	if halfLifeHours <= 0 || m.CreatedAt == nil {
+		return 1.0
+	}
+	elapsedHours := now.Sub(*m.CreatedAt).Hours()
+	if elapsedHours <= 0 {
+		return 1.0
+	}
+	s := clamp(m.Salience, 0, 1)
+	effHalfLife := halfLifeHours * (1.0 + 4.0*s)
+	floor := 0.3 * s
+	return clamp(floor+(1.0-floor)*math.Pow(2.0, -elapsedHours/effHalfLife), 0, 1)
+}
+
+func effectiveStepAlpha(baseAlpha, salience, decay float64) float64 {
+	s := clamp(salience, 0, 1)
+	salientAlpha := baseAlpha + (1.0-baseAlpha)*0.5*s
+	return clamp(salientAlpha*decay, 0, 1)
 }
 
 func cosineSimilarity(a, b []float64) float64 {
@@ -619,9 +769,10 @@ func finite(v float64) bool {
 	return !math.IsNaN(v) && !math.IsInf(v, 0)
 }
 
-func partialResult(initial InitialState, current Affect, steps []Step) Result {
+func partialResult(cfg Temperament, initial InitialState, current Affect, steps []Step) Result {
 	return Result{
-		Initial: initial,
+		Temperament: cfg,
+		Initial:     initial,
 		Final: Summary{
 			Valence:    current.Valence,
 			Activation: current.Activation,
