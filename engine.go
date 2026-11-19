@@ -25,8 +25,10 @@ const (
 	DefaultRadius = 1.0
 	// DefaultMinSimilarity is the default minimum cosine similarity required when embeddings are enabled in Spec.Build.
 	DefaultMinSimilarity = 0.35
-	// DefaultPoolSize is the default candidate pool size sampled uniformly at each depth step.
+	// DefaultPoolSize is the default candidate pool size sampled at each depth step.
 	DefaultPoolSize = 3
+	// DefaultMinP is the default relative score floor against the top candidate used by Spec.Build when omitted.
+	DefaultMinP = 0.7
 	// DefaultMaxVisits is the default maximum number of times a single memory may be recalled in one run.
 	DefaultMaxVisits = 2
 	// DefaultHalfLifeHours is the default memory recency half-life in hours (30 days) used by Spec.Build when omitted.
@@ -56,6 +58,7 @@ type Temperament struct {
 	Radius        float64 `json:"radius"`
 	MinSimilarity float64 `json:"min_similarity"`
 	PoolSize      int     `json:"pool_size"`
+	MinP          float64 `json:"min_p"`
 	MaxVisits     int     `json:"max_visits"`
 	HalfLifeHours float64 `json:"half_life_hours"`
 }
@@ -72,15 +75,17 @@ type Memory struct {
 	Embedding  []float64  `json:"embedding,omitempty"`
 }
 
-// Engine evaluates stimuli against a positioned memory store or inline memory slice according to a Temperament.
+// Engine evaluates stimuli against a positioned memory store or inline memory slice according to an optional Persona and Temperament.
 type Engine struct {
+	Persona     string
 	Temperament Temperament
 	Memories    []Memory
 	Store       MemoryStore
 }
 
-// RunOptions supplies optional embedding ranking, initial mood positioning, evaluation timestamp, and deterministic randomness.
+// RunOptions supplies optional persona override, embedding ranking, initial mood positioning, evaluation timestamp, and deterministic randomness.
 type RunOptions struct {
+	Persona  string
 	Embedder Embedder
 	Query    string
 	Initial  *Point
@@ -144,8 +149,9 @@ type Summary struct {
 	Steps      int        `json:"steps"`
 }
 
-// Result contains the active temperament, initial baseline, final affect summary, and ordered recall steps.
+// Result contains the active persona, temperament, initial baseline, final affect summary, and ordered recall steps.
 type Result struct {
+	Persona     string       `json:"persona,omitempty"`
 	Temperament Temperament  `json:"temperament"`
 	Initial     InitialState `json:"initial"`
 	Final       Summary      `json:"final"`
@@ -153,6 +159,7 @@ type Result struct {
 }
 
 type evaluationState struct {
+	Persona    string `json:"persona,omitempty"`
 	Input      any    `json:"input"`
 	Depth      int    `json:"depth"`
 	MemoryID   string `json:"memory_id"`
@@ -196,7 +203,12 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 		}
 	}
 
-	initial, err := resolveInitial(ctx, client, input, opts.Initial)
+	persona := strings.TrimSpace(e.Persona)
+	if p := strings.TrimSpace(opts.Persona); p != "" {
+		persona = p
+	}
+
+	initial, err := resolveInitial(ctx, client, input, persona, opts.Initial)
 	if err != nil {
 		return Result{}, err
 	}
@@ -214,6 +226,7 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 
 	if math.Hypot(probe.Valence, probe.Activation) <= cfg.Deadzone {
 		return Result{
+			Persona:     persona,
 			Temperament: cfg,
 			Initial:     initial,
 			Final: Summary{
@@ -229,7 +242,7 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 
 	store, queryVec, err := e.prepareStore(ctx, opts.Embedder, opts.Query, input.State, preDim)
 	if err != nil {
-		return partialResult(cfg, initial, current, steps), err
+		return partialResult(persona, cfg, initial, current, steps), err
 	}
 
 	visits := make(map[string]int)
@@ -255,7 +268,7 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 			Limit:         fetchLimit,
 		})
 		if err != nil {
-			return partialResult(cfg, initial, current, steps), err
+			return partialResult(persona, cfg, initial, current, steps), err
 		}
 		if len(hits) == 0 {
 			stopReason = StopNoMemory
@@ -263,18 +276,18 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 		}
 
 		candidates := rerankCandidates(hits, cfg, now)
-		poolLimit := min(cfg.PoolSize, len(candidates))
-		pool := candidates[:poolLimit]
+		pool := filterPool(candidates, cfg.PoolSize, cfg.MinP)
 		poolIDs := make([]string, len(pool))
 		for i, c := range pool {
 			poolIDs[i] = c.memory.ID
 		}
 
-		chosen := pool[pickIndex(opts.Rand, len(pool))]
+		chosen := pool[pickWeighted(opts.Rand, pool)]
 		visits[chosen.memory.ID]++
 		visit := visits[chosen.memory.ID]
 
 		evalState := evaluationState{
+			Persona:    persona,
 			Input:      input.State,
 			Depth:      d,
 			MemoryID:   chosen.memory.ID,
@@ -286,15 +299,15 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 		}
 		resp, err := client.Evaluate(ctx, decisions.Request{
 			Input:     decisions.Input{State: evalState, Assets: input.Assets},
-			Questions: memoryQuestions(),
+			Questions: memoryQuestions(persona),
 		})
 		if err != nil {
-			return partialResult(cfg, initial, current, steps), fmt.Errorf("braingate: depth %d memory %q: %w", d, chosen.memory.ID, err)
+			return partialResult(persona, cfg, initial, current, steps), fmt.Errorf("braingate: depth %d memory %q: %w", d, chosen.memory.ID, err)
 		}
 
 		raw, err := parseRawReading(resp, chosen.memory.ID)
 		if err != nil {
-			return partialResult(cfg, initial, current, steps), err
+			return partialResult(persona, cfg, initial, current, steps), err
 		}
 
 		baseAlpha := cfg.Alpha
@@ -342,9 +355,17 @@ func (e *Engine) Run(ctx context.Context, client *decisions.Client, input decisi
 			stopReason = StopDepthReached
 			break
 		}
+		if len(queryVec) > 0 {
+			nextVec, err := nextMemoryQueryVector(ctx, opts.Embedder, chosen.memory, len(queryVec))
+			if err != nil {
+				return partialResult(persona, cfg, initial, current, steps), err
+			}
+			queryVec = nextVec
+		}
 	}
 
 	return Result{
+		Persona:     persona,
 		Temperament: cfg,
 		Initial:     initial,
 		Final: Summary{
@@ -398,6 +419,9 @@ func resolveTemperament(t Temperament) (Temperament, error) {
 	if poolSize < 0 {
 		return Temperament{}, fmt.Errorf("braingate: pool_size must be >= 1, got %d", t.PoolSize)
 	}
+	if !finite(t.MinP) || t.MinP < 0 || t.MinP > 1 {
+		return Temperament{}, fmt.Errorf("braingate: min_p must be in [0, 1], got %v", t.MinP)
+	}
 
 	maxVisits := t.MaxVisits
 	if maxVisits == 0 {
@@ -417,6 +441,7 @@ func resolveTemperament(t Temperament) (Temperament, error) {
 		Radius:        radius,
 		MinSimilarity: t.MinSimilarity,
 		PoolSize:      poolSize,
+		MinP:          t.MinP,
 		MaxVisits:     maxVisits,
 		HalfLifeHours: t.HalfLifeHours,
 	}, nil
@@ -472,7 +497,7 @@ func validatePoint(p Point) error {
 	return nil
 }
 
-func resolveInitial(ctx context.Context, client *decisions.Client, input decisions.Input, supplied *Point) (InitialState, error) {
+func resolveInitial(ctx context.Context, client *decisions.Client, input decisions.Input, persona string, supplied *Point) (InitialState, error) {
 	if supplied != nil {
 		return InitialState{
 			Source:     "supplied",
@@ -482,12 +507,13 @@ func resolveInitial(ctx context.Context, client *decisions.Client, input decisio
 	}
 
 	evalInput := struct {
-		Input any `json:"input"`
-	}{Input: input.State}
+		Persona string `json:"persona,omitempty"`
+		Input   any    `json:"input"`
+	}{Persona: persona, Input: input.State}
 
 	resp, err := client.Evaluate(ctx, decisions.Request{
 		Input:     decisions.Input{State: evalInput, Assets: input.Assets},
-		Questions: initialQuestions(),
+		Questions: initialQuestions(persona),
 	})
 	if err != nil {
 		return InitialState{}, fmt.Errorf("braingate: initial appraisal: %w", err)
@@ -565,6 +591,31 @@ func prepareQueryEmbedding(ctx context.Context, embedder Embedder, queryOverride
 		}
 	}
 	return vecs[0], nil
+}
+
+func nextMemoryQueryVector(ctx context.Context, embedder Embedder, m Memory, expectedDim int) ([]float64, error) {
+	if len(m.Embedding) > 0 {
+		if len(m.Embedding) != expectedDim {
+			return nil, fmt.Errorf("braingate: memory %q embedding dimension %d does not match query dimension %d", m.ID, len(m.Embedding), expectedDim)
+		}
+		for _, v := range m.Embedding {
+			if !finite(v) {
+				return nil, fmt.Errorf("braingate: memory %q embedding contains non-finite value", m.ID)
+			}
+		}
+		return slices.Clone(m.Embedding), nil
+	}
+	if embedder == nil {
+		return nil, fmt.Errorf("braingate: memory %q has no embedding and embedder is nil", m.ID)
+	}
+	vec, err := prepareQueryEmbedding(ctx, embedder, memoryText(m), nil)
+	if err != nil {
+		return nil, err
+	}
+	if len(vec) != expectedDim {
+		return nil, fmt.Errorf("braingate: memory %q embedding dimension %d does not match query dimension %d", m.ID, len(vec), expectedDim)
+	}
+	return vec, nil
 }
 
 func buildExcludeMap(lastID string, visits map[string]int, maxVisits int) map[string]bool {
@@ -751,6 +802,58 @@ func cosineSimilarity(a, b []float64) float64 {
 	return clamp(dot/(math.Sqrt(normA)*math.Sqrt(normB)), -1, 1)
 }
 
+func filterPool(candidates []candidate, poolSize int, minP float64) []candidate {
+	limit := min(poolSize, len(candidates))
+	if limit <= 1 {
+		return candidates[:limit]
+	}
+	topScore := candidates[0].score
+	if minP <= 0 || topScore <= 0 {
+		return candidates[:limit]
+	}
+	cutoff := topScore * minP
+	kept := 1
+	for kept < limit && candidates[kept].score >= cutoff {
+		kept++
+	}
+	return candidates[:kept]
+}
+
+func pickWeighted(rng *rand.Rand, pool []candidate) int {
+	if len(pool) <= 1 {
+		return 0
+	}
+	total := 0.0
+	lastPositive := -1
+	for i, c := range pool {
+		if c.score > 0 {
+			total += c.score
+			lastPositive = i
+		}
+	}
+	if total <= 0 {
+		return pickIndex(rng, len(pool))
+	}
+	var u float64
+	if rng != nil {
+		u = rng.Float64()
+	} else {
+		u = rand.Float64()
+	}
+	target := u * total
+	acc := 0.0
+	for i, c := range pool {
+		if c.score <= 0 {
+			continue
+		}
+		acc += c.score
+		if target < acc {
+			return i
+		}
+	}
+	return lastPositive
+}
+
 func pickIndex(rng *rand.Rand, n int) int {
 	if n <= 1 {
 		return 0
@@ -769,8 +872,9 @@ func finite(v float64) bool {
 	return !math.IsNaN(v) && !math.IsInf(v, 0)
 }
 
-func partialResult(cfg Temperament, initial InitialState, current Affect, steps []Step) Result {
+func partialResult(persona string, cfg Temperament, initial InitialState, current Affect, steps []Step) Result {
 	return Result{
+		Persona:     persona,
 		Temperament: cfg,
 		Initial:     initial,
 		Final: Summary{
@@ -825,14 +929,26 @@ func clamp(v, minVal, maxVal float64) float64 {
 	return v
 }
 
-func initialQuestions() decisions.Questions {
+func initialQuestions(persona string) decisions.Questions {
+	if persona != "" {
+		return scoreQuestionPair(
+			"주어진 인물 성향(persona)을 가진 사람의 관점과 기질을 기준으로, 자극과 문맥(input)을 접했을 때 기억을 떠올리기 전에 즉각 느껴지는 원초적 선호-불호(valence) 반응 수준을 평가하라.",
+			"주어진 인물 성향(persona)을 가진 사람의 관점과 기질을 기준으로, 자극과 문맥(input)을 접했을 때 기억을 떠올리기 전에 즉각 느껴지는 행동 에너지의 활성-억제(activation) 반응 수준을 평가하라.",
+		)
+	}
 	return scoreQuestionPair(
 		"주어진 자극과 문맥(input)만 보고 기억을 떠올리기 전에 즉각 느껴지는 원초적 선호-불호(valence) 반응 수준을 평가하라.",
 		"주어진 자극과 문맥(input)만 보고 기억을 떠올리기 전에 즉각 느껴지는 행동 에너지의 활성-억제(activation) 반응 수준을 평가하라.",
 	)
 }
 
-func memoryQuestions() decisions.Questions {
+func memoryQuestions(persona string) decisions.Questions {
+	if persona != "" {
+		return scoreQuestionPair(
+			"주어진 인물 성향(persona)을 가진 사람의 관점과 기질을 기준으로, 자극과 문맥(input), 현재 누적 정서 상태(state)와 이전 회상 경로(history), 그리고 지금 떠오른 기억(cue, experience)을 바탕으로 즉각 유도되는 선호-불호(valence) 반응 수준을 평가하라.",
+			"주어진 인물 성향(persona)을 가진 사람의 관점과 기질을 기준으로, 자극과 문맥(input), 현재 누적 정서 상태(state)와 이전 회상 경로(history), 그리고 지금 떠오른 기억(cue, experience)을 바탕으로 즉각 유도되는 행동 에너지의 활성-억제(activation) 반응 수준을 평가하라.",
+		)
+	}
 	return scoreQuestionPair(
 		"주어진 자극과 문맥(input), 현재 누적 정서 상태(state)와 이전 회상 경로(history), 그리고 지금 떠오른 기억(cue, experience)을 바탕으로 즉각 유도되는 선호-불호(valence) 반응 수준을 평가하라.",
 		"주어진 자극과 문맥(input), 현재 누적 정서 상태(state)와 이전 회상 경로(history), 그리고 지금 떠오른 기억(cue, experience)을 바탕으로 즉각 유도되는 행동 에너지의 활성-억제(activation) 반응 수준을 평가하라.",

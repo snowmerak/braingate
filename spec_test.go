@@ -12,6 +12,7 @@ import (
 
 func TestParseSpecBuildsDefaultsAndMemories(t *testing.T) {
 	const definition = `{
+		"persona": "  신중하고 사려 깊은 성향  ",
 		"memories": [
 			{
 				"id": "m1",
@@ -35,6 +36,9 @@ func TestParseSpecBuildsDefaultsAndMemories(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseSpec error = %v", err)
 	}
+	if engine.Persona != "신중하고 사려 깊은 성향" {
+		t.Fatalf("persona = %q, want %q", engine.Persona, "신중하고 사려 깊은 성향")
+	}
 
 	wantTemp := braingate.Temperament{
 		Depth:         braingate.DefaultDepth,
@@ -43,6 +47,7 @@ func TestParseSpecBuildsDefaultsAndMemories(t *testing.T) {
 		Radius:        braingate.DefaultRadius,
 		MinSimilarity: braingate.DefaultMinSimilarity,
 		PoolSize:      braingate.DefaultPoolSize,
+		MinP:          braingate.DefaultMinP,
 		MaxVisits:     braingate.DefaultMaxVisits,
 		HalfLifeHours: braingate.DefaultHalfLifeHours,
 	}
@@ -57,7 +62,7 @@ func TestParseSpecBuildsDefaultsAndMemories(t *testing.T) {
 
 func TestParseSpecPreservesExplicitZeroDeadzone(t *testing.T) {
 	const definition = `{
-		"temperament": { "deadzone": 0, "depth": 2, "radius": 1.5, "min_similarity": -0.2, "half_life_hours": 0 },
+		"temperament": { "deadzone": 0, "depth": 2, "radius": 1.5, "min_similarity": -0.2, "min_p": 0, "half_life_hours": 0 },
 		"memories": [
 			{ "id": "m1", "position": { "valence": 0.5, "activation": 0.5 }, "experience": "기억" }
 		]
@@ -66,7 +71,7 @@ func TestParseSpecPreservesExplicitZeroDeadzone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseSpec error = %v", err)
 	}
-	if engine.Temperament.Deadzone != 0 || engine.Temperament.Depth != 2 || engine.Temperament.Radius != 1.5 || engine.Temperament.MinSimilarity != -0.2 || engine.Temperament.HalfLifeHours != 0 {
+	if engine.Temperament.Deadzone != 0 || engine.Temperament.Depth != 2 || engine.Temperament.Radius != 1.5 || engine.Temperament.MinSimilarity != -0.2 || engine.Temperament.MinP != 0 || engine.Temperament.HalfLifeHours != 0 {
 		t.Fatalf("unexpected temperament: %+v", engine.Temperament)
 	}
 }
@@ -168,6 +173,16 @@ func TestSpecBuildValidationErrors(t *testing.T) {
 			name: "negative half_life_hours",
 			spec: braingate.Spec{Temperament: braingate.TemperamentSpec{HalfLifeHours: f(-1)}, Memories: []braingate.MemorySpec{validMem}},
 			want: "half_life_hours",
+		},
+		{
+			name: "min_p < 0",
+			spec: braingate.Spec{Temperament: braingate.TemperamentSpec{MinP: f(-0.1)}, Memories: []braingate.MemorySpec{validMem}},
+			want: "min_p",
+		},
+		{
+			name: "min_p > 1",
+			spec: braingate.Spec{Temperament: braingate.TemperamentSpec{MinP: f(1.1)}, Memories: []braingate.MemorySpec{validMem}},
+			want: "min_p",
 		},
 		{
 			name: "blank memory id",

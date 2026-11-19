@@ -283,6 +283,7 @@ func (s *QdrantStore) Search(ctx context.Context, query SearchQuery) ([]ScoredMe
 			"score_threshold": query.MinSimilarity,
 			"limit":           overfetch,
 			"with_payload":    true,
+			"with_vector":     true,
 		}
 		status, body, err := s.doJSON(ctx, http.MethodPost, colPath+"/points/query", reqBody)
 		if err != nil {
@@ -311,6 +312,9 @@ func (s *QdrantStore) Search(ctx context.Context, query SearchQuery) ([]ScoredMe
 			}
 			if rec.Score < query.MinSimilarity {
 				continue
+			}
+			if vec := parseQdrantVector(rec.Vector); len(vec) > 0 {
+				m.Embedding = vec
 			}
 			sim := clamp(rec.Score, -1, 1)
 			results = append(results, ScoredMemory{
@@ -408,8 +412,26 @@ func (p qdrantPayload) toMemory() (Memory, error) {
 }
 
 type qdrantPointRecord struct {
-	Score   float64       `json:"score"`
-	Payload qdrantPayload `json:"payload"`
+	Score   float64         `json:"score"`
+	Vector  json.RawMessage `json:"vector,omitempty"`
+	Payload qdrantPayload   `json:"payload"`
+}
+
+func parseQdrantVector(raw json.RawMessage) []float64 {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil
+	}
+	var vec []float64
+	if err := json.Unmarshal(trimmed, &vec); err != nil {
+		return nil
+	}
+	for _, v := range vec {
+		if !finite(v) {
+			return nil
+		}
+	}
+	return vec
 }
 
 func decodeQdrantPoints(body []byte) ([]qdrantPointRecord, error) {

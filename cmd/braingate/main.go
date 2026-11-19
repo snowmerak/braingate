@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"os"
 	"os/signal"
@@ -17,16 +18,20 @@ import (
 	"github.com/snowmerak/decisions"
 )
 
-const usage = "usage: braingate -spec <file> [-context <text>] [-depth <n>] [-pool-size <n>] [-now <RFC3339>] [-store hnsw|qdrant] [-qdrant-url <url>] [-qdrant-collection <name>] [-embed-url <url>] [-embed-model <name>] [-no-embed] [-seed <n>] <stimulus>"
+const usage = "usage: braingate -spec <file> [-persona <text>] [-context <text>] [-depth <n>] [-pool-size <n>] [-min-p <ratio>] [-now <RFC3339>] [-store hnsw|qdrant] [-qdrant-url <url>] [-qdrant-collection <name>] [-embed-url <url>] [-embed-model <name>] [-no-embed] [-seed <n>] <stimulus>"
 
 type cliOptions struct {
 	specPath         string
 	stimulus         string
+	persona          string
+	personaSet       bool
 	previousContext  string
 	depth            int
 	depthSet         bool
 	poolSize         int
 	poolSizeSet      bool
+	minP             float64
+	minPSet          bool
 	now              string
 	store            string
 	qdrantURL        string
@@ -45,9 +50,11 @@ func main() {
 	defaultQdrantCollection := envOrDefault("BRAINGATE_QDRANT_COLLECTION", braingate.DefaultQdrantCollection)
 
 	specPath := flag.String("spec", "", "memory specification in JSON")
+	personaFlag := flag.String("persona", "", "override persona description passed only to decisions")
 	previousContext := flag.String("context", "", "context preceding the stimulus")
 	depth := flag.Int("depth", 0, "override temperament descent depth")
 	poolSize := flag.Int("pool-size", 0, "override temperament candidate pool size")
+	minPFlag := flag.Float64("min-p", 0, "override temperament min_p cutoff ratio in [0, 1]")
 	nowFlag := flag.String("now", "", "evaluation timestamp in RFC3339 format (default: current time)")
 	store := flag.String("store", defaultStore, "memory store backend: hnsw or qdrant")
 	qdrantURL := flag.String("qdrant-url", defaultQdrantURL, "Qdrant REST base URL")
@@ -62,13 +69,17 @@ func main() {
 	}
 	flag.Parse()
 
-	var depthSet, poolSizeSet, seedSet bool
+	var personaSet, depthSet, poolSizeSet, minPSet, seedSet bool
 	flag.Visit(func(f *flag.Flag) {
 		switch f.Name {
+		case "persona":
+			personaSet = true
 		case "depth":
 			depthSet = true
 		case "pool-size":
 			poolSizeSet = true
+		case "min-p":
+			minPSet = true
 		case "seed":
 			seedSet = true
 		}
@@ -77,11 +88,15 @@ func main() {
 	opts := cliOptions{
 		specPath:         *specPath,
 		stimulus:         strings.Join(flag.Args(), " "),
+		persona:          *personaFlag,
+		personaSet:       personaSet,
 		previousContext:  *previousContext,
 		depth:            *depth,
 		depthSet:         depthSet,
 		poolSize:         *poolSize,
 		poolSizeSet:      poolSizeSet,
+		minP:             *minPFlag,
+		minPSet:          minPSet,
 		now:              *nowFlag,
 		store:            *store,
 		qdrantURL:        *qdrantURL,
@@ -155,6 +170,9 @@ func runWith(
 	if opts.poolSize < 0 || (opts.poolSizeSet && opts.poolSize == 0) {
 		return errors.New("pool-size must be >= 1")
 	}
+	if opts.minPSet && (math.IsNaN(opts.minP) || math.IsInf(opts.minP, 0) || opts.minP < 0 || opts.minP > 1) {
+		return fmt.Errorf("invalid -min-p ratio %v (want [0, 1])", opts.minP)
+	}
 	var parsedNow time.Time
 	if trimmedNow := strings.TrimSpace(opts.now); trimmedNow != "" {
 		parsed, err := time.Parse(time.RFC3339, trimmedNow)
@@ -176,11 +194,17 @@ func runWith(
 	if err != nil {
 		return err
 	}
+	if opts.personaSet {
+		engine.Persona = strings.TrimSpace(opts.persona)
+	}
 	if opts.depth > 0 {
 		engine.Temperament.Depth = opts.depth
 	}
 	if opts.poolSize > 0 {
 		engine.Temperament.PoolSize = opts.poolSize
+	}
+	if opts.minPSet {
+		engine.Temperament.MinP = opts.minP
 	}
 
 	client, err := getClient()

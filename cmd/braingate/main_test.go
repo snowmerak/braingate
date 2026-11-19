@@ -73,6 +73,14 @@ func TestRunValidatesArgumentsAndEnv(t *testing.T) {
 		}
 	})
 
+	t.Run("invalid min-p", func(t *testing.T) {
+		var out bytes.Buffer
+		err := run(t.Context(), cliOptions{specPath: exampleSpec, stimulus: "자극", minP: 1.5, minPSet: true, noEmbed: true}, &out)
+		if err == nil || !strings.Contains(err.Error(), "-min-p") {
+			t.Fatalf("err = %v, want -min-p error", err)
+		}
+	})
+
 	t.Run("invalid store", func(t *testing.T) {
 		var out bytes.Buffer
 		err := run(t.Context(), cliOptions{specPath: exampleSpec, stimulus: "자극", store: "postgres", noEmbed: true}, &out)
@@ -131,9 +139,13 @@ func TestRunWithExecutesExampleSpecWithEmbedderAndSeed(t *testing.T) {
 		cliOptions{
 			specPath:        exampleSpec,
 			stimulus:        "따뜻한 격려",
+			persona:         "차분한 분석가",
+			personaSet:      true,
 			previousContext: "회의 직후",
 			depth:           2,
 			poolSize:        2,
+			minP:            0.8,
+			minPSet:         true,
 			now:             "2026-11-20T15:00:00+09:00",
 			seed:            &seed,
 		},
@@ -145,13 +157,19 @@ func TestRunWithExecutesExampleSpecWithEmbedderAndSeed(t *testing.T) {
 	if len(gotEmbedTexts) == 0 || gotEmbedTexts[0] != "회의 직후\n따뜻한 격려" {
 		t.Fatalf("unexpected query embedding text: %v", gotEmbedTexts)
 	}
+	if strings.Contains(strings.Join(gotEmbedTexts, "\n"), "차분한 분석가") {
+		t.Fatalf("persona leaked into embeddings: %v", gotEmbedTexts)
+	}
 
 	var result braingate.Result
 	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
 		t.Fatalf("decode CLI stdout JSON: %v\noutput:\n%s", err, out.String())
 	}
-	if result.Temperament.Depth != 2 || result.Temperament.PoolSize != 2 || result.Temperament.HalfLifeHours != braingate.DefaultHalfLifeHours {
-		t.Fatalf("temperament = %+v, want depth=2 pool_size=2 half_life_hours=%v", result.Temperament, braingate.DefaultHalfLifeHours)
+	if result.Persona != "차분한 분석가" {
+		t.Fatalf("persona = %q, want %q", result.Persona, "차분한 분석가")
+	}
+	if result.Temperament.Depth != 2 || result.Temperament.PoolSize != 2 || result.Temperament.MinP != 0.8 || result.Temperament.HalfLifeHours != braingate.DefaultHalfLifeHours {
+		t.Fatalf("temperament = %+v, want depth=2 pool_size=2 min_p=0.8 half_life_hours=%v", result.Temperament, braingate.DefaultHalfLifeHours)
 	}
 	if result.Final.StopReason != braingate.StopDepthReached || result.Final.Steps != 2 {
 		t.Fatalf("final = %+v, want depth_reached after 2 steps", result.Final)

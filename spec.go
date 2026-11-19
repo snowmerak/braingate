@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 )
 
-// Spec defines a temperament configuration and positioned memory pool in JSON form.
+// Spec defines a persona, temperament configuration, and positioned memory pool in JSON form.
 type Spec struct {
+	Persona     string          `json:"persona,omitempty"`
 	Temperament TemperamentSpec `json:"temperament,omitempty"`
 	Memories    []MemorySpec    `json:"memories"`
 }
@@ -23,6 +25,7 @@ type TemperamentSpec struct {
 	Radius        *float64 `json:"radius,omitempty"`
 	MinSimilarity *float64 `json:"min_similarity,omitempty"`
 	PoolSize      *int     `json:"pool_size,omitempty"`
+	MinP          *float64 `json:"min_p,omitempty"`
 	MaxVisits     *int     `json:"max_visits,omitempty"`
 	HalfLifeHours *float64 `json:"half_life_hours,omitempty"`
 }
@@ -107,6 +110,7 @@ func (spec Spec) Build() (*Engine, error) {
 	}
 
 	return &Engine{
+		Persona:     strings.TrimSpace(spec.Persona),
 		Temperament: temperament,
 		Memories:    memories,
 	}, nil
@@ -177,6 +181,14 @@ func (t TemperamentSpec) build() (Temperament, error) {
 		halfLifeHours = *t.HalfLifeHours
 	}
 
+	minP := DefaultMinP
+	if t.MinP != nil {
+		if !finite(*t.MinP) || *t.MinP < 0 || *t.MinP > 1 {
+			return Temperament{}, fmt.Errorf("braingate: min_p must be in [0, 1], got %v", *t.MinP)
+		}
+		minP = *t.MinP
+	}
+
 	return Temperament{
 		Depth:         depth,
 		Alpha:         alpha,
@@ -184,6 +196,7 @@ func (t TemperamentSpec) build() (Temperament, error) {
 		Radius:        radius,
 		MinSimilarity: minSimilarity,
 		PoolSize:      poolSize,
+		MinP:          minP,
 		MaxVisits:     maxVisits,
 		HalfLifeHours: halfLifeHours,
 	}, nil

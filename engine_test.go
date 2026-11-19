@@ -695,3 +695,358 @@ func TestEngineTimeDecayAndSalienceAlpha(t *testing.T) {
 		}
 	})
 }
+
+func TestEngineAssociativeChainingUsesRecalledMemoryContext(t *testing.T) {
+	t.Run("chains stored memory vector at depth 2 without extra embed calls", func(t *testing.T) {
+		engine := &braingate.Engine{
+			Temperament: braingate.Temperament{
+				Depth:         2,
+				Alpha:         0.5,
+				Deadzone:      0.1,
+				Radius:        1.0,
+				MinSimilarity: 0.55,
+				PoolSize:      1,
+				MaxVisits:     1,
+			},
+			Memories: []braingate.Memory{
+				{
+					ID:         "bridge",
+					Cue:        "중간 연상",
+					Position:   braingate.Point{Valence: 0.5, Activation: 0.5},
+					Experience: "초기 자극과 이어진 중간 기억",
+					Embedding:  []float64{0.8, 0.6, 0},
+				},
+				{
+					ID:         "chained_from_bridge",
+					Cue:        "꼬리 연상",
+					Position:   braingate.Point{Valence: 0.5, Activation: 0.5},
+					Experience: "중간 기억에서만 이어지는 기억",
+					Embedding:  []float64{0, 1, 0},
+				},
+				{
+					ID:         "initial_echo",
+					Cue:        "초기 유사",
+					Position:   braingate.Point{Valence: 0.5, Activation: 0.5},
+					Experience: "초기 자극과만 조금 비슷한 기억",
+					Embedding:  []float64{0.6, 0, 0.8},
+				},
+			},
+		}
+
+		embedCalls := 0
+		embedder := fakeEmbedder(func(_ context.Context, texts []string) ([][]float64, error) {
+			embedCalls++
+			if !reflect.DeepEqual(texts, []string{"초기 상황"}) {
+				t.Fatalf("unexpected embed batch: %v", texts)
+			}
+			return [][]float64{{1, 0, 0}}, nil
+		})
+
+		got, err := engine.Run(t.Context(), fixedScoreClient(t, 3, 3), decisions.Input{State: "초기 상황"}, braingate.RunOptions{
+			Embedder: embedder,
+			Initial:  &braingate.Point{Valence: 0.5, Activation: 0.5},
+		})
+		if err != nil {
+			t.Fatalf("Run error = %v", err)
+		}
+		if embedCalls != 1 {
+			t.Fatalf("embedCalls = %d, want 1", embedCalls)
+		}
+		if len(got.Steps) != 2 || got.Steps[0].Memory != "bridge" || got.Steps[1].Memory != "chained_from_bridge" {
+			t.Fatalf("steps = %+v, want [bridge chained_from_bridge]", got.Steps)
+		}
+		if got.Steps[1].Similarity == nil || !almostEqual(*got.Steps[1].Similarity, 0.6) {
+			t.Fatalf("step 2 similarity = %v, want 0.6", got.Steps[1].Similarity)
+		}
+	})
+
+	t.Run("embeds recalled memory text when custom store omits embedding on search hit", func(t *testing.T) {
+		inner := braingate.NewHNSWStore(braingate.HNSWConfig{})
+		if err := inner.Upsert(t.Context(), []braingate.Memory{
+			{
+				ID:         "m1",
+				Cue:        "회의실 정적",
+				Position:   braingate.Point{Valence: 0.5, Activation: 0.5},
+				Experience: "발표 직후 어색했던 기억",
+				Embedding:  []float64{1, 0},
+			},
+			{
+				ID:         "m2",
+				Cue:        "꼬리 기억",
+				Position:   braingate.Point{Valence: 0.5, Activation: 0.5},
+				Experience: "정적 뒤에 몰려온 기억",
+				Embedding:  []float64{0, 1},
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		store := &strippingMemoryStore{inner: inner}
+		var batches [][]string
+		embedder := fakeEmbedder(func(_ context.Context, texts []string) ([][]float64, error) {
+			batches = append(batches, append([]string(nil), texts...))
+			switch len(batches) {
+			case 1:
+				return [][]float64{{1, 0}}, nil
+			case 2:
+				return [][]float64{{0, 1}}, nil
+			default:
+				return nil, fmt.Errorf("unexpected embed call %d: %v", len(batches), texts)
+			}
+		})
+
+		engine := &braingate.Engine{
+			Temperament: braingate.Temperament{
+				Depth:         2,
+				Alpha:         0.5,
+				Deadzone:      0.1,
+				Radius:        1.0,
+				MinSimilarity: 0.5,
+				PoolSize:      1,
+				MaxVisits:     1,
+			},
+			Store: store,
+		}
+		got, err := engine.Run(t.Context(), fixedScoreClient(t, 3, 3), decisions.Input{State: "초기 자극"}, braingate.RunOptions{
+			Embedder: embedder,
+			Initial:  &braingate.Point{Valence: 0.5, Activation: 0.5},
+		})
+		if err != nil {
+			t.Fatalf("Run error = %v", err)
+		}
+		wantBatches := [][]string{
+			{"초기 자극"},
+			{"회의실 정적\n발표 직후 어색했던 기억"},
+		}
+		if !reflect.DeepEqual(batches, wantBatches) {
+			t.Fatalf("embed batches = %v, want %v", batches, wantBatches)
+		}
+		wantQueries := [][]float64{{1, 0}, {0, 1}}
+		if !reflect.DeepEqual(store.queries, wantQueries) {
+			t.Fatalf("store queries = %v, want %v", store.queries, wantQueries)
+		}
+		if len(got.Steps) != 2 || got.Steps[0].Memory != "m1" || got.Steps[1].Memory != "m2" {
+			t.Fatalf("steps = %+v, want [m1 m2]", got.Steps)
+		}
+	})
+}
+
+type strippingMemoryStore struct {
+	inner   braingate.MemoryStore
+	queries [][]float64
+}
+
+func (s *strippingMemoryStore) Upsert(ctx context.Context, memories []braingate.Memory) error {
+	return s.inner.Upsert(ctx, memories)
+}
+
+func (s *strippingMemoryStore) Delete(ctx context.Context, ids []string) error {
+	return s.inner.Delete(ctx, ids)
+}
+
+func (s *strippingMemoryStore) Search(ctx context.Context, query braingate.SearchQuery) ([]braingate.ScoredMemory, error) {
+	s.queries = append(s.queries, append([]float64(nil), query.Vector...))
+	hits, err := s.inner.Search(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	for i := range hits {
+		hits[i].Memory.Embedding = nil
+	}
+	return hits, nil
+}
+
+func TestEngineMinPAndWeightedPoolSampling(t *testing.T) {
+	initial := &braingate.Point{Valence: 0.2, Activation: 0}
+
+	t.Run("min_p prunes low-scoring tail candidates from pool", func(t *testing.T) {
+		memories := []braingate.Memory{
+			{ID: "top", Position: braingate.Point{Valence: 0.3, Activation: 0}, Experience: "1등"},
+			{ID: "close_second", Position: braingate.Point{Valence: 0.45, Activation: 0}, Experience: "2등"},
+			{ID: "weak_third", Position: braingate.Point{Valence: 0.8, Activation: 0}, Experience: "약한 3등"},
+		}
+		client := fixedScoreClient(t, 3, 3)
+
+		engine70 := &braingate.Engine{
+			Temperament: braingate.Temperament{Depth: 1, Alpha: 0.5, Deadzone: 0.1, Radius: 1.0, PoolSize: 3, MinP: 0.7, MaxVisits: 1},
+			Memories:    memories,
+		}
+		got70, err := engine70.Run(t.Context(), client, decisions.Input{State: "자극"}, braingate.RunOptions{
+			Initial: initial,
+			Rand:    rand.New(rand.NewPCG(1, 2)),
+		})
+		if err != nil {
+			t.Fatalf("Run (min_p=0.7) error = %v", err)
+		}
+		if len(got70.Steps) != 1 || !reflect.DeepEqual(got70.Steps[0].Pool, []string{"top", "close_second"}) {
+			t.Fatalf("pool (min_p=0.7) = %+v, want [top close_second]", got70.Steps)
+		}
+
+		engine90 := &braingate.Engine{
+			Temperament: braingate.Temperament{Depth: 1, Alpha: 0.5, Deadzone: 0.1, Radius: 1.0, PoolSize: 3, MinP: 0.9, MaxVisits: 1},
+			Memories:    memories,
+		}
+		got90, err := engine90.Run(t.Context(), client, decisions.Input{State: "자극"}, braingate.RunOptions{
+			Initial: initial,
+			Rand:    rand.New(rand.NewPCG(1, 2)),
+		})
+		if err != nil {
+			t.Fatalf("Run (min_p=0.9) error = %v", err)
+		}
+		if len(got90.Steps) != 1 || !reflect.DeepEqual(got90.Steps[0].Pool, []string{"top"}) {
+			t.Fatalf("pool (min_p=0.9) = %+v, want [top]", got90.Steps)
+		}
+	})
+
+	t.Run("weighted sampling favors higher score over uniform 50-50", func(t *testing.T) {
+		engine := &braingate.Engine{
+			Temperament: braingate.Temperament{Depth: 1, Alpha: 0.5, Deadzone: 0.1, Radius: 1.0, PoolSize: 2, MinP: 0, MaxVisits: 1},
+			Memories: []braingate.Memory{
+				{ID: "high", Position: braingate.Point{Valence: 0.3, Activation: 0}, Experience: "높은 점수"},
+				{ID: "low", Position: braingate.Point{Valence: -0.7, Activation: 0}, Experience: "낮은 점수"},
+			},
+		}
+		client := fixedScoreClient(t, 3, 3)
+		rng := rand.New(rand.NewPCG(7, 8))
+
+		highCount := 0
+		for range 300 {
+			got, err := engine.Run(t.Context(), client, decisions.Input{State: "자극"}, braingate.RunOptions{
+				Initial: initial,
+				Rand:    rng,
+			})
+			if err != nil {
+				t.Fatalf("Run error = %v", err)
+			}
+			if len(got.Steps) != 1 {
+				t.Fatalf("steps = %d, want 1", len(got.Steps))
+			}
+			if got.Steps[0].Memory == "high" {
+				highCount++
+			}
+		}
+		if highCount <= 230 {
+			t.Fatalf("highCount = %d / 300, want > 230 (~90%% weighted)", highCount)
+		}
+	})
+
+	t.Run("rejects out-of-range min_p", func(t *testing.T) {
+		client := fixedScoreClient(t, 2, 2)
+		mem := []braingate.Memory{{ID: "m1", Position: braingate.Point{}, Experience: "exp"}}
+		for _, v := range []float64{-0.1, 1.1} {
+			bad := &braingate.Engine{
+				Temperament: braingate.Temperament{MinP: v},
+				Memories:    mem,
+			}
+			if _, err := bad.Run(t.Context(), client, decisions.Input{State: "s"}, braingate.RunOptions{}); err == nil || !strings.Contains(err.Error(), "min_p") {
+				t.Fatalf("MinP=%v expected error, got %v", v, err)
+			}
+		}
+	})
+}
+
+func TestEnginePersonaInjectedIntoDecisionsAndExcludedFromEmbeddings(t *testing.T) {
+	memories := []braingate.Memory{
+		{ID: "m1", Cue: "칭찬 기억", Position: braingate.Point{Valence: 0.7, Activation: 0.6}, Experience: "인정받았던 기억"},
+		{ID: "m2", Cue: "경계 기억", Position: braingate.Point{Valence: 0.6, Activation: 0.5}, Experience: "속내를 의심했던 기억"},
+	}
+
+	assertPersonaFlow := func(t *testing.T, enginePersona, optPersona, wantPersona, forbiddenSubstr string) {
+		t.Helper()
+		var embeddedTexts []string
+		embedder := fakeEmbedder(func(_ context.Context, texts []string) ([][]float64, error) {
+			embeddedTexts = append(embeddedTexts, texts...)
+			vecs := make([][]float64, len(texts))
+			for i := range texts {
+				vecs[i] = []float64{1, 0}
+			}
+			return vecs, nil
+		})
+
+		type questionReq struct {
+			Instructions string `json:"instructions"`
+		}
+		var seenPersonas []string
+		var seenValenceInstr []string
+		var seenActivationInstr []string
+
+		client, err := decisions.NewClient(decisions.Config{
+			API:   decisions.SystemOneAPI,
+			Model: "test",
+			HTTPClient: &http.Client{Transport: testTransport(func(r *http.Request) (*http.Response, error) {
+				defer func() { _ = r.Body.Close() }()
+				var req struct {
+					State struct {
+						Persona string `json:"persona"`
+					} `json:"state"`
+					Questions struct {
+						Valence    questionReq `json:"valence"`
+						Activation questionReq `json:"activation"`
+					} `json:"questions"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					return nil, err
+				}
+				seenPersonas = append(seenPersonas, req.State.Persona)
+				seenValenceInstr = append(seenValenceInstr, req.Questions.Valence.Instructions)
+				seenActivationInstr = append(seenActivationInstr, req.Questions.Activation.Instructions)
+
+				payload, err := json.Marshal(map[string]any{
+					"model": "test",
+					"usage": map[string]any{"input_tokens": 1, "output_tokens": 1},
+					"answers": map[string]any{
+						"valence":    encodeScoreAnswer(&scoreAnswerSpec{score: 4, confidence: 0.9}),
+						"activation": encodeScoreAnswer(&scoreAnswerSpec{score: 4, confidence: 0.9}),
+					},
+				})
+				if err != nil {
+					return nil, err
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(string(payload)))}, nil
+			})},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		engine := &braingate.Engine{
+			Persona:     enginePersona,
+			Temperament: braingate.Temperament{Depth: 2, Alpha: 0.5, Deadzone: 0.1, Radius: 1.0, MinSimilarity: 0.3, PoolSize: 1, MaxVisits: 1},
+			Memories:    memories,
+		}
+		got, err := engine.Run(t.Context(), client, decisions.Input{State: "팀장님이 칭찬을 건넸다"}, braingate.RunOptions{
+			Persona:  optPersona,
+			Embedder: embedder,
+		})
+		if err != nil {
+			t.Fatalf("Run error = %v", err)
+		}
+		if got.Persona != wantPersona {
+			t.Fatalf("result.Persona = %q, want %q", got.Persona, wantPersona)
+		}
+		if len(seenPersonas) != 3 { // initial + depth 1 + depth 2
+			t.Fatalf("seenPersonas count = %d, want 3", len(seenPersonas))
+		}
+		for i, p := range seenPersonas {
+			if p != wantPersona {
+				t.Fatalf("decisions call %d state.persona = %q, want %q", i, p, wantPersona)
+			}
+			if !strings.Contains(seenValenceInstr[i], "persona") || !strings.Contains(seenActivationInstr[i], "persona") {
+				t.Fatalf("decisions call %d instructions did not reference persona: %q / %q", i, seenValenceInstr[i], seenActivationInstr[i])
+			}
+		}
+		for _, text := range embeddedTexts {
+			if strings.Contains(text, wantPersona) || strings.Contains(text, forbiddenSubstr) {
+				t.Fatalf("persona leaked into embedder text %q", text)
+			}
+		}
+	}
+
+	t.Run("uses trimmed Engine.Persona without leaking to embeddings", func(t *testing.T) {
+		assertPersonaFlow(t, "  칭찬을 경계하는 냉소적 성향  ", "", "칭찬을 경계하는 냉소적 성향", "냉소적")
+	})
+
+	t.Run("RunOptions.Persona overrides Engine.Persona", func(t *testing.T) {
+		assertPersonaFlow(t, "기본 성향", "  직설적 피드백에서 안도하는 성향  ", "직설적 피드백에서 안도하는 성향", "안도하는")
+	})
+}

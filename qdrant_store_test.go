@@ -105,9 +105,13 @@ func TestQdrantStoreLifecycleAndCircularRefinement(t *testing.T) {
 						} `json:"must_not"`
 					} `json:"filter"`
 					ScoreThreshold float64 `json:"score_threshold"`
+					WithVector     bool    `json:"with_vector"`
 				}
 				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 					t.Fatal(err)
+				}
+				if !req.WithVector {
+					t.Fatalf("expected with_vector=true in query request")
 				}
 				if len(req.Filter.Must) != 2 || len(req.Filter.MustNot) != 1 || len(req.Filter.MustNot[0].HasID) != 1 {
 					t.Fatalf("unexpected query filter: %+v", req.Filter)
@@ -120,7 +124,7 @@ func TestQdrantStoreLifecycleAndCircularRefinement(t *testing.T) {
 					"result": {
 						"points": [
 							{"id":"uuid-corner","score":0.95,"payload":{"memory_id":"corner_outside","valence":0.8,"activation":0.8,"experience":"모서리"}},
-							{"id":"uuid-valid","score":0.90,"payload":{"memory_id":"inside_circle","cue":"단서","valence":-0.6,"activation":0.6,"experience":"원 안","alpha":0.4,"salience":0.85,"created_at":"2026-11-10T12:00:00Z"}},
+							{"id":"uuid-valid","score":0.90,"vector":[1,0,0],"payload":{"memory_id":"inside_circle","cue":"단서","valence":-0.6,"activation":0.6,"experience":"원 안","alpha":0.4,"salience":0.85,"created_at":"2026-11-10T12:00:00Z"}},
 							{"id":"uuid-excl","score":0.99,"payload":{"memory_id":"excluded","valence":0.1,"activation":0.1,"experience":"제외"}}
 						]
 					},
@@ -181,7 +185,7 @@ func TestQdrantStoreLifecycleAndCircularRefinement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Search error = %v", err)
 	}
-	if len(hits) != 1 || hits[0].Memory.ID != "inside_circle" || hits[0].Memory.Alpha != 0.4 || hits[0].Memory.Salience != 0.85 || hits[0].Memory.CreatedAt == nil || !hits[0].Memory.CreatedAt.Equal(createdAt) || hits[0].Similarity == nil || !almostEqual(*hits[0].Similarity, 0.90) {
+	if len(hits) != 1 || hits[0].Memory.ID != "inside_circle" || hits[0].Memory.Alpha != 0.4 || hits[0].Memory.Salience != 0.85 || hits[0].Memory.CreatedAt == nil || !hits[0].Memory.CreatedAt.Equal(createdAt) || !reflect.DeepEqual(hits[0].Memory.Embedding, []float64{1, 0, 0}) || hits[0].Similarity == nil || !almostEqual(*hits[0].Similarity, 0.90) {
 		t.Fatalf("hits = %+v, want only [inside_circle]", hits)
 	}
 

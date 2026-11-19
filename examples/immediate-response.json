@@ -1,4 +1,5 @@
 {
+  "persona": "칭찬과 호의에는 진심으로 반가워하면서도, 주변의 시선이나 숨은 기대가 느껴지면 성급히 나서기보다 한 호흡 가다듬고 신중하게 거리를 조율하는 사람.",
   "temperament": {
     "depth": 4,
     "alpha": 0.5,
@@ -6,6 +7,7 @@
     "radius": 1.0,
     "min_similarity": 0.35,
     "pool_size": 3,
+    "min_p": 0.7,
     "max_visits": 2,
     "half_life_hours": 720
   },
