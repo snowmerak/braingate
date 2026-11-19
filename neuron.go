@@ -16,6 +16,9 @@ var ErrCycle = errors.New("braingate: cycle in neuron route")
 type Choice struct {
 	decisions.Choice
 	Next *Neuron
+
+	// Text is an optional phrase or sentence contributed by this choice.
+	Text string
 }
 
 // Neuron asks one Decisions choice question. Use a distinct ID for each neuron
@@ -33,6 +36,20 @@ type Selection struct {
 	Choice        string             `json:"choice"`
 	Confidence    float64            `json:"confidence"`
 	Probabilities map[string]float64 `json:"probabilities"`
+	Text          string             `json:"text,omitempty"`
+}
+
+// ComposeText joins the selected text in execution order with single spaces.
+// Choices supply their own punctuation. Blank text contributes nothing.
+func ComposeText(history []Selection) string {
+	parts := make([]string, 0, len(history))
+	for _, selection := range history {
+		if part := strings.TrimSpace(selection.Text); part != "" {
+			parts = append(parts, part)
+		}
+	}
+
+	return strings.Join(parts, " ")
 }
 
 type decisionState struct {
@@ -41,9 +58,9 @@ type decisionState struct {
 }
 
 // Run starts at n and follows the selected choice at each neuron. Every
-// question receives the initial input state and all prior selections under
-// the JSON keys input and history, along with the original assets. Run returns
-// the selections completed before any error.
+// question receives the initial input state and all prior selections, including
+// their text, under the JSON keys input and history, along with the original
+// assets. Run returns the selections completed before any error.
 func (n *Neuron) Run(ctx context.Context, client *decisions.Client, input decisions.Input) ([]Selection, error) {
 	if n == nil {
 		return nil, errors.New("braingate: starting neuron is required")
@@ -74,23 +91,25 @@ func (n *Neuron) Run(ctx context.Context, client *decisions.Client, input decisi
 		}
 
 		answer := result.Answer
+		selected := neuron.choice(answer.Choice)
 		state.History = append(state.History, Selection{
 			NeuronID:      neuron.ID,
 			Choice:        answer.Choice,
 			Confidence:    answer.Confidence,
 			Probabilities: answer.Probabilities,
+			Text:          selected.Text,
 		})
-		neuron = neuron.next(answer.Choice)
+		neuron = selected.Next
 	}
 
 	return state.History, nil
 }
 
-func (n *Neuron) next(value string) *Neuron {
+func (n *Neuron) choice(value string) Choice {
 	for _, choice := range n.Choices {
 		if choice.Value == value {
-			return choice.Next
+			return choice
 		}
 	}
-	return nil
+	return Choice{}
 }
