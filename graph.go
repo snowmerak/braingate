@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	// DefaultAlpha is the default blending rate applied to raw coordinates when Graph.Alpha is zero.
+	// DefaultAlpha is the default blending rate applied to raw coordinates from the second gate onward when Graph.Alpha is zero.
 	DefaultAlpha = 0.5
 	// DefaultMaxVisits is the default per-gate visit limit when Graph.MaxVisits is zero.
 	DefaultMaxVisits = 2
@@ -81,7 +81,7 @@ type RawReading struct {
 	ActivationConfidence float64 `json:"activation_confidence"`
 }
 
-// StepState captures the cumulative state and change delta after blending a gate's raw reading.
+// StepState captures the cumulative state and change delta after recording a gate's reading.
 type StepState struct {
 	Valence    float64 `json:"valence"`
 	Activation float64 `json:"activation"`
@@ -124,8 +124,10 @@ type evaluationState struct {
 }
 
 // Run executes the graph starting at g.Start until an explicit stop, graph end,
-// visit limit, or step limit is reached. Any error returns the completed steps
-// and state prior to the failure.
+// visit limit, or step limit is reached. The first gate establishes the baseline
+// cumulative state from its raw reading (delta = 0, stress = 0); subsequent gates
+// blend raw readings using alpha and accumulate movement delta into stress. Any
+// error returns the completed steps and state prior to the failure.
 func (g *Graph) Run(ctx context.Context, client *decisions.Client, input decisions.Input) (Result, error) {
 	if g == nil || g.Start == nil {
 		return Result{}, errors.New("braingate: starting gate is required")
@@ -173,12 +175,14 @@ func (g *Graph) Run(ctx context.Context, client *decisions.Client, input decisio
 			return partialResult(current, steps), err
 		}
 
-		nextV := clamp((1-stepAlpha)*current.Valence+stepAlpha*raw.Valence, -1, 1)
-		nextA := clamp((1-stepAlpha)*current.Activation+stepAlpha*raw.Activation, -1, 1)
-
-		var delta float64
+		var nextV, nextA, delta float64
 		nextStress := current.Stress
-		if len(steps) >= 1 {
+		if len(steps) == 0 {
+			nextV = raw.Valence
+			nextA = raw.Activation
+		} else {
+			nextV = clamp((1-stepAlpha)*current.Valence+stepAlpha*raw.Valence, -1, 1)
+			nextA = clamp((1-stepAlpha)*current.Activation+stepAlpha*raw.Activation, -1, 1)
 			delta = math.Hypot(nextV-current.Valence, nextA-current.Activation)
 			nextStress += delta
 		}

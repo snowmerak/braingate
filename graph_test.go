@@ -148,24 +148,24 @@ func TestRunRawRoutingInertiaAndStressFromSecondGate(t *testing.T) {
 		t.Fatalf("calls=%d, steps=%d, want 3", calls, len(got.Steps))
 	}
 
-	delta2 := math.Hypot(0.0-0.5, 0.25-0.5)
-	delta3 := math.Hypot(-0.25-0.0, 0.4375-0.25)
+	delta2 := math.Hypot(0.25-1.0, 0.5-1.0)
+	delta3 := math.Hypot(-0.0625-0.25, 0.625-0.5)
 	wantStress := delta2 + delta3
 
-	// Step 1: stress and delta must be 0.
+	// Step 1: establishes baseline from raw reading; stress and delta must be 0.
 	s0 := got.Steps[0]
 	if s0.Gate != "gate1" || s0.Route != "positive_active" || s0.Next != "gate2" ||
 		!almostEqual(s0.Raw.Valence, 1.0) || !almostEqual(s0.Raw.Activation, 1.0) ||
-		!almostEqual(s0.State.Valence, 0.5) || !almostEqual(s0.State.Activation, 0.5) ||
+		!almostEqual(s0.State.Valence, 1.0) || !almostEqual(s0.State.Activation, 1.0) ||
 		s0.State.Delta != 0 || s0.State.Stress != 0 {
 		t.Fatalf("step 0 = %+v", s0)
 	}
 
-	// Step 2: blended valence is 0.0, raw valence is -0.5 -> must route via raw_negative, not blended_trap.
+	// Step 2: blended valence is 0.25, raw valence is -0.5 -> must route via raw_negative, not blended_trap.
 	s1 := got.Steps[1]
 	if s1.Gate != "gate2" || s1.Route != "raw_negative" || s1.Next != "gate3" ||
 		!almostEqual(s1.Raw.Valence, -0.5) || !almostEqual(s1.Raw.Activation, 0.0) ||
-		!almostEqual(s1.State.Valence, 0.0) || !almostEqual(s1.State.Activation, 0.25) ||
+		!almostEqual(s1.State.Valence, 0.25) || !almostEqual(s1.State.Activation, 0.5) ||
 		!almostEqual(s1.State.Delta, delta2) || !almostEqual(s1.State.Stress, delta2) {
 		t.Fatalf("step 1 = %+v", s1)
 	}
@@ -174,13 +174,13 @@ func TestRunRawRoutingInertiaAndStressFromSecondGate(t *testing.T) {
 	s2 := got.Steps[2]
 	if s2.Gate != "gate3" || s2.Route != "" || s2.Next != "" ||
 		!almostEqual(s2.Raw.Valence, -1.0) || !almostEqual(s2.Raw.Activation, 1.0) ||
-		!almostEqual(s2.State.Valence, -0.25) || !almostEqual(s2.State.Activation, 0.4375) ||
+		!almostEqual(s2.State.Valence, -0.0625) || !almostEqual(s2.State.Activation, 0.625) ||
 		!almostEqual(s2.State.Delta, delta3) || !almostEqual(s2.State.Stress, wantStress) {
 		t.Fatalf("step 2 = %+v", s2)
 	}
 
 	if got.Final.StopReason != braingate.StopEndOfGraph || got.Final.Steps != 3 ||
-		!almostEqual(got.Final.Valence, -0.25) || !almostEqual(got.Final.Activation, 0.4375) ||
+		!almostEqual(got.Final.Valence, -0.0625) || !almostEqual(got.Final.Activation, 0.625) ||
 		!almostEqual(got.Final.Stress, wantStress) {
 		t.Fatalf("final = %+v", got.Final)
 	}
@@ -357,7 +357,7 @@ func TestRunPreservesPartialStepsOnRefusal(t *testing.T) {
 	if len(got.Steps) != 1 || got.Final.Steps != 1 {
 		t.Fatalf("expected 1 preserved step on refusal, got %+v", got)
 	}
-	if !almostEqual(got.Final.Valence, 0.5) || !almostEqual(got.Final.Activation, -0.5) || got.Final.Stress != 0 {
+	if !almostEqual(got.Final.Valence, 1.0) || !almostEqual(got.Final.Activation, -1.0) || got.Final.Stress != 0 {
 		t.Fatalf("unexpected partial final state: %+v", got.Final)
 	}
 	if got.Final.StopReason != "" {
