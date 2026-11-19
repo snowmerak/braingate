@@ -1,0 +1,116 @@
+{
+  "start": "initial_appraisal",
+  "alpha": 0.5,
+  "max_visits": 2,
+  "max_steps": 16,
+  "gates": [
+    {
+      "id": "initial_appraisal",
+      "experience": "예상치 못한 자극이나 타인의 말·행동을 마주했을 때, 즉각적으로 느껴지는 호감/반감과 다가서거나 물러서고 싶은 첫인상 반응의 기준 기억.",
+      "routes": [
+        {
+          "name": "like_activate",
+          "valence": { "min": 0.0, "max": 1.0 },
+          "activation": { "min": 0.0, "max": 1.0 },
+          "next": "eager_memory"
+        },
+        {
+          "name": "like_inhibit",
+          "valence": { "min": 0.0, "max": 1.0 },
+          "activation": { "min": -1.0, "max": 0.0 },
+          "stop": true
+        },
+        {
+          "name": "dislike_activate",
+          "valence": { "min": -1.0, "max": 0.0 },
+          "activation": { "min": 0.0, "max": 1.0 },
+          "next": "defensive_memory"
+        },
+        {
+          "name": "dislike_inhibit",
+          "valence": { "min": -1.0, "max": 0.0 },
+          "activation": { "min": -1.0, "max": 0.0 },
+          "next": "withdrawal_memory"
+        }
+      ]
+    },
+    {
+      "id": "eager_memory",
+      "experience": "호감을 느껴 성급하게 다가가고 관여했다가, 상대의 기대나 반응과 어긋나 민망하거나 부담을 겪었던 기억이 있다.",
+      "routes": [
+        {
+          "name": "reinforced_approach",
+          "valence": { "min": 0.2, "max": 1.0 },
+          "activation": { "min": 0.2, "max": 1.0 },
+          "next": "stabilized_approach"
+        },
+        {
+          "name": "hesitation_conflict",
+          "valence": { "min": -1.0, "max": 1.0 },
+          "activation": { "min": -1.0, "max": 0.2 },
+          "next": "defensive_memory"
+        },
+        {
+          "name": "cautious_shift",
+          "valence": { "min": -1.0, "max": 0.2 },
+          "activation": { "min": 0.2, "max": 1.0 },
+          "next": "defensive_memory"
+        }
+      ]
+    },
+    {
+      "id": "defensive_memory",
+      "experience": "불편하거나 날 선 태도를 느꼈을 때 즉각 방어적으로 맞섰다가 갈등이 증폭되었고, 반대로 억눌렀다가도 뒤늦게 답답함이 남았던 기억이 있다.",
+      "routes": [
+        {
+          "name": "conflict_rumination",
+          "valence": { "min": 0.0, "max": 1.0 },
+          "activation": { "min": -1.0, "max": 1.0 },
+          "next": "eager_memory"
+        },
+        {
+          "name": "guarded_pushback",
+          "valence": { "min": -1.0, "max": 0.0 },
+          "activation": { "min": 0.0, "max": 1.0 },
+          "next": "stabilized_defense"
+        },
+        {
+          "name": "cool_down",
+          "valence": { "min": -1.0, "max": 0.0 },
+          "activation": { "min": -1.0, "max": 0.0 },
+          "next": "withdrawal_memory"
+        }
+      ]
+    },
+    {
+      "id": "withdrawal_memory",
+      "experience": "부담스럽거나 위축되는 상황에서는 섣불리 반응하지 않고 말을 아끼며 한 발 물러서서 상황을 지켜보던 습관적 기억이 있다.",
+      "routes": [
+        {
+          "name": "quiet_withdrawal",
+          "valence": { "min": -1.0, "max": 0.0 },
+          "activation": { "min": -1.0, "max": 0.2 },
+          "stop": true
+        },
+        {
+          "name": "reconsider_engage",
+          "valence": { "min": 0.0, "max": 1.0 },
+          "activation": { "min": 0.0, "max": 1.0 },
+          "next": "eager_memory"
+        },
+        {
+          "name": "reluctant_guard",
+          "next": "stabilized_defense"
+        }
+      ]
+    },
+    {
+      "id": "stabilized_approach",
+      "experience": "상황과 의도가 충분히 안전하다고 확인되면 과열되지 않은 차분한 호의로 반응 방향을 굳힌다."
+    },
+    {
+      "id": "stabilized_defense",
+      "experience": "감정적 소모를 키우기보다 필요한 경계만 분명히 유지한 채 거리를 확보하며 반응을 정리한다."
+    }
+  ]
+}
