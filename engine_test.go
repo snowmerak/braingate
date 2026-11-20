@@ -1142,3 +1142,83 @@ func TestEngineDualEmbeddingGeometricCalibrationAndChaining(t *testing.T) {
 		}
 	})
 }
+
+func TestEngineRadiusActsAsGateWithoutSpatialScorePenalty(t *testing.T) {
+	runWithEdgePos := func(t *testing.T, edgePos braingate.Point) braingate.Result {
+		t.Helper()
+		engine := &braingate.Engine{
+			Temperament: braingate.Temperament{
+				Depth:         1,
+				Alpha:         0.5,
+				Deadzone:      0.1,
+				Radius:        1.0,
+				MinSimilarity: 0.2,
+				PoolSize:      3,
+				MinP:          0.7,
+				MaxVisits:     1,
+			},
+			Memories: []braingate.Memory{
+				{
+					ID:                 "close_weak",
+					Position:           braingate.Point{Valence: 0.21, Activation: 0},
+					Experience:         "가깝지만 의미가 약한 기억",
+					Embedding:          []float64{0.70, 0.7141428429},
+					SecondaryEmbedding: []float64{0.35, 0.9367496998},
+				},
+				{
+					ID:                 "edge_strong",
+					Position:           edgePos,
+					Experience:         "반경 경계에 있지만 의미가 강한 기억",
+					Embedding:          []float64{0.96, 0.28},
+					SecondaryEmbedding: []float64{0.90, 0.4358898944},
+				},
+				{
+					ID:                 "outside_stronger",
+					Position:           braingate.Point{Valence: -0.85, Activation: 0},
+					Experience:         "의미는 최고지만 반경 밖 기억",
+					Embedding:          []float64{1, 0},
+					SecondaryEmbedding: []float64{1, 0},
+				},
+			},
+		}
+
+		unitQueryEmbedder := fakeEmbedder(func(_ context.Context, texts []string) ([][]float64, error) {
+			if len(texts) != 1 {
+				t.Fatalf("expected query-only batch, got %d texts", len(texts))
+			}
+			return [][]float64{{1, 0}}, nil
+		})
+
+		got, err := engine.Run(t.Context(), fixedScoreClient(t, 3, 3), decisions.Input{State: "초기 사건"}, braingate.RunOptions{
+			Embedder:          unitQueryEmbedder,
+			SecondaryEmbedder: unitQueryEmbedder,
+			Initial:           &braingate.Point{Valence: 0.2, Activation: 0},
+		})
+		if err != nil {
+			t.Fatalf("Run error = %v", err)
+		}
+		return got
+	}
+
+	edgeGot := runWithEdgePos(t, braingate.Point{Valence: -0.79, Activation: 0})
+	if len(edgeGot.Steps) != 1 {
+		t.Fatalf("steps = %d, want 1", len(edgeGot.Steps))
+	}
+	if edgeGot.Steps[0].Memory != "edge_strong" || !reflect.DeepEqual(edgeGot.Steps[0].Pool, []string{"edge_strong"}) {
+		t.Fatalf("edge run step = %+v, want memory=edge_strong pool=[edge_strong]", edgeGot.Steps[0])
+	}
+	if !almostEqual(edgeGot.Steps[0].Distance, 0.99) {
+		t.Fatalf("edge distance = %v, want 0.99", edgeGot.Steps[0].Distance)
+	}
+
+	nearGot := runWithEdgePos(t, braingate.Point{Valence: 0.30, Activation: 0})
+	if len(nearGot.Steps) != 1 || nearGot.Steps[0].Memory != "edge_strong" {
+		t.Fatalf("near run step = %+v, want edge_strong", nearGot.Steps)
+	}
+	if !almostEqual(nearGot.Steps[0].Distance, 0.10) {
+		t.Fatalf("near distance = %v, want 0.10", nearGot.Steps[0].Distance)
+	}
+	if !almostEqual(edgeGot.Steps[0].Score, nearGot.Steps[0].Score) {
+		t.Fatalf("score changed with affect distance inside radius: edge=%v near=%v", edgeGot.Steps[0].Score, nearGot.Steps[0].Score)
+	}
+}

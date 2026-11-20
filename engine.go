@@ -846,8 +846,7 @@ func rerankCandidates(hits []ScoredMemory, cfg Temperament, now time.Time) []can
 
 	candidates := make([]candidate, 0, len(hits))
 	for _, h := range hits {
-		spatial := clamp(1.0-h.Distance/cfg.Radius, 0, 1)
-		baseScore := spatial
+		var baseScore float64
 		var cosPtr, secCosPtr *float64
 		if h.Similarity != nil {
 			cos1 := *h.Similarity
@@ -859,7 +858,9 @@ func rerankCandidates(hits []ScoredMemory, cfg Temperament, now time.Time) []can
 				sem2 := modelSemanticScore(cos2, minCos2, maxCos2)
 				sem = math.Sqrt(sem * sem2)
 			}
-			baseScore = math.Sqrt(spatial * sem)
+			baseScore = sem
+		} else {
+			baseScore = clamp(1.0-h.Distance/cfg.Radius, 0, 1)
 		}
 
 		decay := memoryDecay(h.Memory, now, cfg.HalfLifeHours)
